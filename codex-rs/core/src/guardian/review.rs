@@ -1,5 +1,6 @@
 use codex_analytics::GuardianApprovalRequestSource;
 use codex_analytics::GuardianReviewAnalyticsResult;
+use codex_login::AuthManager;
 use codex_analytics::GuardianReviewDecision;
 use codex_analytics::GuardianReviewFailureReason;
 use codex_analytics::GuardianReviewTerminalStatus;
@@ -855,9 +856,30 @@ pub(super) async fn guardian_review_session_config(
     };
     let model_override = turn.model_info().auto_review_model_override.as_deref();
     let review_model_id = model_override.unwrap_or(default_review_model_id);
-    let review_model = available_models
-        .iter()
-        .find(|preset| preset.model == review_model_id);
+    // `available_models` is filtered by auth mode/visibility, not by whether
+    // the *active provider* can actually serve a given model id. For custom
+    // providers (Azure OpenAI, self-hosted proxies, etc.) the default
+    // preferred review model (e.g. `codex-auto-review`) can still show up in
+    // that catalog even though it isn't a real deployment on that provider,
+    // which previously caused the guardian to send a literal
+    // `codex-auto-review` model id to a non-OpenAI-hosted backend and 404.
+    // Only trust the catalog match when the user explicitly configured an
+    // override, or when the provider actually routes through OpenAI-hosted
+    // infrastructure; otherwise fall through to the active session model.
+    let provider_can_serve_preferred_review_model = model_override.is_some()
+        || turn.provider.info().uses_openai_actor_authorization()
+        || (turn.provider.info().requires_openai_auth
+            && turn
+                .auth_manager
+                .as_deref()
+                .is_some_and(AuthManager::current_auth_uses_codex_backend));
+    let review_model = provider_can_serve_preferred_review_model
+        .then(|| {
+            available_models
+                .iter()
+                .find(|preset| preset.model == review_model_id)
+        })
+        .flatten();
     let guardian_catalog_contains_auto_review = available_models
         .iter()
         .any(|preset| preset.model == default_review_model_id);
