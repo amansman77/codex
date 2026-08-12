@@ -25,9 +25,10 @@ impl RetryOn {
             return false;
         }
         match err {
-            TransportError::Http { status, .. } => {
+            TransportError::Http { status, body, .. } => {
                 (self.retry_429 && status.as_u16() == 429)
                     || (self.retry_5xx && status.is_server_error())
+                    || is_transient_item_not_found(status.as_u16(), body)
             }
             TransportError::Timeout
             | TransportError::Connection(_)
@@ -35,6 +36,25 @@ impl RetryOn {
             _ => false,
         }
     }
+}
+
+/// Detects the Responses API's intermittent "Item with id '...' not found"
+/// error (HTTP 400, `invalid_request_error`, `param: "input"`). This shows up
+/// when a reasoning/function-call item is referenced in a follow-up request
+/// before it has finished replicating on the backend (observed on Azure
+/// OpenAI in particular). It is a transient server-side lookup race, not a
+/// malformed request, and reliably succeeds on immediate retry, so we treat
+/// it as retryable rather than surfacing it to the user on the first hit.
+fn is_transient_item_not_found(status: u16, body: &Option<String>) -> bool {
+    if status != 400 {
+        return false;
+    }
+    let Some(body) = body else {
+        return false;
+    };
+    body.contains("invalid_request_error")
+        && body.contains("not found")
+        && (body.contains("Item with id") || body.contains("\"param\":\"input\""))
 }
 
 pub fn backoff(base: Duration, attempt: u64) -> Duration {
