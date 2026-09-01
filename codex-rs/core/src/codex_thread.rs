@@ -176,13 +176,11 @@ impl GuardianRootMessage {
     }
 }
 
-/// Authorization state that changes on history rewrites or genuine user input.
+/// Authorization state that changes on genuine user input or history resets.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GuardianAuthorizationVersion {
-    /// Conversation-history rewrite generation.
-    pub history_version: u64,
-    /// Number of genuine user messages in the conversation snapshot.
-    pub user_message_count: usize,
+    /// User-message/reset revision, preserved across compaction and internal context.
+    pub user_message_revision: u64,
     /// Number of successful, host-produced answers to genuine user-input requests.
     pub user_input_response_count: usize,
 }
@@ -191,11 +189,7 @@ impl GuardianAuthorizationVersion {
     /// Captures history replacement and genuine user input from the same snapshot.
     pub fn from_history(history: &dyn ConversationHistorySnapshot) -> Self {
         Self {
-            history_version: history.history_version(),
-            user_message_count: history
-                .items()
-                .filter(|item| item.is_user_message())
-                .count(),
+            user_message_revision: history.user_message_revision(),
             user_input_response_count: 0,
         }
     }
@@ -396,8 +390,15 @@ impl CodexThread {
             trace,
             cyber_access_program,
         } = request;
+        let root_turn_id = self
+            .session
+            .reference_context_item()
+            .await
+            .filter(|context| context.turn_id.as_deref() == Some(turn_id.as_str()))
+            .and_then(|context| context.root_turn_id);
         let start_options = TurnStartOptions {
             cyber_access_program,
+            root_turn_id,
             ..Default::default()
         };
         match self
@@ -508,6 +509,16 @@ impl CodexThread {
         items: Vec<ResponseItem>,
     ) -> Result<(), Vec<ResponseItem>> {
         self.session.inject_if_running(items).await
+    }
+
+    /// Returns the trusted root when the expected turn is currently active.
+    pub async fn active_turn_root(&self, expected_turn_id: &str) -> Option<String> {
+        let active = self.session.active_turn.lock().await;
+        let task = active.as_ref()?.task.as_ref()?;
+        if task.turn_context.sub_id != expected_turn_id {
+            return None;
+        }
+        task.turn_context.turn_metadata_state.root_turn_id()
     }
 
     pub async fn set_app_server_client_info(
@@ -809,7 +820,7 @@ impl CodexThread {
         self.session.multi_agent_version()
     }
 
-    /// Returns the current history generation and genuine user-input counts for Guardian.
+    /// Returns the current user-authorization revision for Guardian.
     pub async fn guardian_authorization_version(&self) -> GuardianAuthorizationVersion {
         let history = self.session.conversation_history_snapshot().await;
         self.thread_extension_data()
