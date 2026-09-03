@@ -175,6 +175,8 @@ pub(crate) enum RateLimitRefreshOrigin {
     ResetConsume { request_id: u64 },
     /// Refresh backend recovery after an inference limit error.
     Recovery,
+    /// Background account usage read, scheduled more frequently near exhaustion.
+    Periodic,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -222,6 +224,9 @@ pub(crate) struct AgentsOverviewThreadRefresh {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, IntoStaticStr)]
 pub(crate) enum AppEvent {
+    ReviewMisalignment(Arc<crate::chatwidget::MisalignmentReview>),
+    ContinueMisalignment(Arc<crate::chatwidget::MisalignmentReview>),
+    CloseMisalignmentReview,
     /// Open the daemon-wide overview of recent and locally retained root sessions.
     OpenAgentsOverview,
     /// Update the daemon-wide overview after a background thread listing finishes.
@@ -268,10 +273,10 @@ pub(crate) enum AppEvent {
         thread_id: ThreadId,
     },
     /// Start the shared app-server daemon without moving the current embedded session.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     StartAgentsDaemon,
     /// Report whether starting the shared app-server daemon succeeded.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     AgentsDaemonStarted {
         result: Result<(), String>,
     },
@@ -296,6 +301,15 @@ pub(crate) enum AppEvent {
     SubmitThreadOp {
         thread_id: ThreadId,
         op: AppCommand,
+    },
+
+    /// Confirm retrying a safety-buffered turn with the server-selected model.
+    ConfirmSafetyBufferedRetry {
+        thread_id: ThreadId,
+        turn_id: String,
+        model: String,
+        turn: AppCommand,
+        prompt: UserMessage,
     },
 
     /// Interrupt, fork, and retry a safety-buffered turn with the server-selected model.
@@ -500,6 +514,11 @@ pub(crate) enum AppEvent {
     /// Refresh account rate limits in the background.
     RefreshRateLimits {
         origin: RateLimitRefreshOrigin,
+    },
+
+    /// Reconcile inherited account usage with an attached task before its queued input runs.
+    ApplyBackendBannerFallback {
+        thread_id: ThreadId,
     },
 
     /// Open the current thread goal summary/action menu.
@@ -961,6 +980,12 @@ pub(crate) enum AppEvent {
 
     /// Update the current reasoning effort in the running app and widget.
     UpdateReasoningEffort(Option<ReasoningEffort>),
+
+    /// Change Reserve effort only on the task that opened the picker, without saving defaults.
+    UpdateLunaReserveReasoning {
+        thread_id: ThreadId,
+        effort: Option<ReasoningEffort>,
+    },
 
     /// Update the current model slug in the running app and widget.
     UpdateModel(String),

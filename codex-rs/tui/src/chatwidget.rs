@@ -365,6 +365,7 @@ mod keymap_picker;
 mod mcp_startup;
 use self::mcp_startup::McpStartupStatus;
 mod misalignment_policy;
+pub(crate) use misalignment_policy::MisalignmentReview;
 mod pets;
 mod session_flow;
 mod session_header;
@@ -395,6 +396,10 @@ mod permissions_menu;
 pub(crate) use self::permissions_menu::auto_review_available;
 pub(crate) use self::permissions_menu::cyber_model_approval_reviewer;
 mod backend_banners;
+mod compaction;
+mod luna_reserve_model;
+mod luna_reserve_return;
+pub(crate) use backend_banners::AutomaticModelSwitchReason;
 mod protocol;
 mod protocol_requests;
 mod rate_limits;
@@ -504,6 +509,7 @@ const DEFAULT_STATUS_LINE_ITEMS: [&str; 2] = ["model-with-reasoning", "current-d
 /// Common initialization parameters shared by all `ChatWidget` constructors.
 pub(crate) struct ChatWidgetInit {
     pub(crate) config: Config,
+    pub(crate) local_settings: crate::local_settings::LocalSettings,
     pub(crate) frame_requester: FrameRequester,
     pub(crate) app_event_tx: AppEventSender,
     /// App-server-backed runner used by status surfaces for workspace metadata probes.
@@ -514,6 +520,7 @@ pub(crate) struct ChatWidgetInit {
     pub(crate) initial_user_message: Option<UserMessage>,
     pub(crate) enhanced_keys_supported: bool,
     pub(crate) has_chatgpt_account: bool,
+    pub(crate) requires_openai_auth: bool,
     pub(crate) has_codex_backend_auth: bool,
     pub(crate) model_catalog: Arc<ModelCatalog>,
     pub(crate) feedback: codex_feedback::CodexFeedback,
@@ -556,6 +563,7 @@ pub(crate) struct ChatWidget {
     bottom_pane: BottomPane,
     transcript: TranscriptState,
     config: Config,
+    pub(crate) local_settings: crate::local_settings::LocalSettings,
     raw_output_mode: bool,
     /// Runtime value resolved by core. `config.service_tier` remains the explicit user choice.
     effective_service_tier: Option<String>,
@@ -566,6 +574,7 @@ pub(crate) struct ChatWidget {
     /// The currently active collaboration mask, if any.
     active_collaboration_mask: Option<CollaborationModeMask>,
     has_chatgpt_account: bool,
+    pub(crate) requires_openai_auth: bool,
     has_codex_backend_auth: bool,
     model_catalog: Arc<ModelCatalog>,
     model_popup_request_id: Option<uuid::Uuid>,
@@ -578,6 +587,7 @@ pub(crate) struct ChatWidget {
     pub(crate) remote_connection: Option<RemoteConnectionStatus>,
     token_info: Option<TokenUsageInfo>,
     token_usage_pending: bool,
+    // Status and polling use account usage reads; response streams may identify meters differently.
     rate_limit_snapshots_by_limit_id: BTreeMap<String, RateLimitSnapshotDisplay>,
     refreshing_status_outputs: Vec<(u64, StatusHistoryHandle)>,
     next_status_refresh_request_id: u64,
@@ -597,7 +607,10 @@ pub(crate) struct ChatWidget {
     codex_spend_control_reached: Option<bool>,
     rate_limit_warnings: RateLimitWarningState,
     backend_banner_state: backend_banners::BackendBannerState,
+    automatic_model_switch_state: backend_banners::AutomaticModelSwitchState,
     backend_banner_notice_model: Option<String>,
+    // Remember the account's Reserve entry notice across chats and transient banner refreshes.
+    luna_reserve_notice_account_id: Option<String>,
     warning_display_state: WarningDisplayState,
     rate_limit_switch_prompt: RateLimitSwitchPromptState,
     add_credits_nudge_email_in_flight: Option<rate_limits::PendingCreditsNudge>,
@@ -679,7 +692,7 @@ pub(crate) struct ChatWidget {
     thread_rename_block_message: Option<String>,
     active_side_conversation: bool,
     blocks_direct_input: bool,
-    misalignment_policy_violation: bool,
+    misalignment_policy_violation: Option<misalignment_policy::MisalignmentViolation>,
     normal_placeholder_text: String,
     side_placeholder_text: String,
     forked_from: Option<ThreadId>,
@@ -1572,7 +1585,7 @@ impl ChatWidget {
         self.flush_answer_stream_with_separator();
         self.flush_active_cell();
         self.transcript.active_cell = Some(Box::new(history_cell::new_mcp_inventory_loading(
-            self.config.animations,
+            self.local_settings.tui.animations,
         )));
         self.bump_active_cell_revision();
         self.request_redraw();
@@ -1636,7 +1649,7 @@ impl ChatWidget {
 
     pub(crate) fn set_raw_output_mode(&mut self, enabled: bool) {
         self.raw_output_mode = enabled;
-        self.config.tui_raw_output_mode = enabled;
+        self.local_settings.tui.raw_output_mode = enabled;
         let render_mode = self.history_render_mode();
         if let Some(controller) = self.stream_controller.as_mut() {
             controller.set_render_mode(render_mode);
@@ -1871,7 +1884,6 @@ impl ChatWidget {
         self.config.features = config.features.clone();
         self.config.config_layer_stack = config.config_layer_stack.clone();
         self.config.memories = config.memories.clone();
-        self.config.terminal_resize_reflow = config.terminal_resize_reflow;
         self.sync_mentions_v2_enabled();
     }
 

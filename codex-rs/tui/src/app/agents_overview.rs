@@ -56,14 +56,14 @@ impl App {
                 subtitle: Some(
                     if workload_identity_selected {
                         "The agents dashboard is unavailable while workload identity is active."
-                    } else if cfg!(unix) {
+                    } else if cfg!(any(unix, windows)) {
                         "This session isn’t connected to a shared background server."
                     } else {
                         "Connect to a remote background server to use the agents dashboard."
                     }
                     .to_string(),
                 ),
-                footer_note: (cfg!(unix) && !workload_identity_selected).then(|| {
+                footer_note: (cfg!(any(unix, windows)) && !workload_identity_selected).then(|| {
                     Line::from(
                         "Starting a background server will not interrupt or move this session."
                             .dim(),
@@ -71,7 +71,7 @@ impl App {
                 }),
                 footer_hint: Some(standard_popup_hint_line_for_keymap(&self.keymap.list)),
                 items: [
-                    #[cfg(unix)]
+                    #[cfg(any(unix, windows))]
                     (!workload_identity_selected).then(|| SelectionItem {
                         name: "Start background server".to_string(),
                         description: Some(
@@ -336,7 +336,7 @@ impl App {
                 target_thread.status,
                 codex_app_server_protocol::ThreadStatus::NotLoaded
             );
-            let mut resume_config = if unloaded {
+            let (mut resume_config, local_settings) = if unloaded {
                 let target_session = SessionTarget {
                     path: target_thread.path.clone(),
                     thread_id: root_thread_id,
@@ -404,7 +404,12 @@ impl App {
                 }
             };
             let resumed = match app_server
-                .resume_thread(resume_config.clone(), root_thread_id, resume_model_settings)
+                .resume_thread(
+                    &local_settings,
+                    resume_config.clone(),
+                    root_thread_id,
+                    resume_model_settings,
+                )
                 .await
             {
                 Ok(resumed) => resumed,
@@ -455,10 +460,11 @@ impl App {
                         && profile.turn_override
                             == RuntimePermissionProfileTurnOverride::LegacySandbox
                 });
+            self.local_settings = local_settings;
             self.config = resume_config;
             tui.set_notification_settings(
-                self.config.tui_notifications.method,
-                self.config.tui_notifications.condition,
+                self.local_settings.tui.notification_settings.method,
+                self.local_settings.tui.notification_settings.condition,
             );
             self.file_search
                 .update_search_dir(self.config.cwd.to_path_buf());
@@ -731,7 +737,7 @@ impl App {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(super) fn start_agents_daemon(&self) {
         let app_event_tx = self.app_event_tx.clone();
         tokio::spawn(async move {
@@ -740,9 +746,19 @@ impl App {
                     std::env::current_exe().map_err(|error| error.to_string())?;
                 let executable = if current_executable
                     .file_stem()
-                    .is_some_and(|name| name == "codex-tui")
-                {
-                    current_executable.with_file_name("codex")
+                    .and_then(std::ffi::OsStr::to_str)
+                    .is_some_and(|name| {
+                        if cfg!(windows) {
+                            name.eq_ignore_ascii_case("codex-tui")
+                        } else {
+                            name == "codex-tui"
+                        }
+                    }) {
+                    current_executable.with_file_name(if cfg!(windows) {
+                        "codex.exe"
+                    } else {
+                        "codex"
+                    })
                 } else {
                     current_executable
                 };

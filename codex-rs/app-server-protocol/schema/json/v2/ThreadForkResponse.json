@@ -92,6 +92,27 @@
         }
       ]
     },
+    "AsyncUserInputQuestion": {
+      "additionalProperties": false,
+      "properties": {
+        "options": {
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "title"
+      ],
+      "type": "object"
+    },
     "ByteRange": {
       "properties": {
         "end": {
@@ -1464,6 +1485,29 @@
       ],
       "type": "string"
     },
+    "ThreadEnvironment": {
+      "description": "An environment selected by a loaded thread, independent of connection status.",
+      "properties": {
+        "cwd": {
+          "$ref": "#/definitions/LegacyAppPathString"
+        },
+        "environmentId": {
+          "type": "string"
+        },
+        "runtimeWorkspaceRoots": {
+          "items": {
+            "$ref": "#/definitions/LegacyAppPathString"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "cwd",
+        "environmentId",
+        "runtimeWorkspaceRoots"
+      ],
+      "type": "object"
+    },
     "ThreadExtra": {
       "description": "Extra app-server data for a thread.",
       "type": "object"
@@ -1577,6 +1621,16 @@
                 }
               ],
               "default": null
+            },
+            "questions": {
+              "default": null,
+              "items": {
+                "$ref": "#/definitions/AsyncUserInputQuestion"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
             },
             "text": {
               "type": "string"

@@ -74,6 +74,7 @@ mod tests {
                 phase: None,
                 memory_citation: None,
                 delivery: None,
+                questions: None,
             },
             ThreadItem::McpToolCall {
                 id: "mcp-1".to_string(),
@@ -125,6 +126,7 @@ mod tests {
                 phase: None,
                 memory_citation: None,
                 delivery: None,
+                questions: None,
             }
         );
         assert_eq!(
@@ -196,6 +198,7 @@ mod tests {
 
     fn test_thread(items: Vec<ThreadItem>) -> Thread {
         Thread {
+            environments: None,
             id: "thread-1".to_string(),
             extra: None,
             session_id: "session-1".to_string(),

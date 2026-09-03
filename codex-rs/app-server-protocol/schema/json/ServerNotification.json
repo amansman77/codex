@@ -522,6 +522,27 @@
         }
       ]
     },
+    "AsyncUserInputQuestion": {
+      "additionalProperties": false,
+      "properties": {
+        "options": {
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "title"
+      ],
+      "type": "object"
+    },
     "AuthMode": {
       "description": "Authentication mode for OpenAI-backed providers.",
       "oneOf": [
@@ -3394,6 +3415,13 @@
             "null"
           ]
         },
+        "normalModelSlug": {
+          "description": "Normal model whose display name and reasoning options describe this quota alias.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "planType": {
           "anyOf": [
             {
@@ -4310,6 +4338,29 @@
       ],
       "type": "object"
     },
+    "ThreadEnvironment": {
+      "description": "An environment selected by a loaded thread, independent of connection status.",
+      "properties": {
+        "cwd": {
+          "$ref": "#/definitions/LegacyAppPathString"
+        },
+        "environmentId": {
+          "type": "string"
+        },
+        "runtimeWorkspaceRoots": {
+          "items": {
+            "$ref": "#/definitions/LegacyAppPathString"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "cwd",
+        "environmentId",
+        "runtimeWorkspaceRoots"
+      ],
+      "type": "object"
+    },
     "ThreadExtra": {
       "description": "Extra app-server data for a thread.",
       "type": "object"
@@ -4512,6 +4563,16 @@
                 }
               ],
               "default": null
+            },
+            "questions": {
+              "default": null,
+              "items": {
+                "$ref": "#/definitions/AsyncUserInputQuestion"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
             },
             "text": {
               "type": "string"

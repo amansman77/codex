@@ -18,19 +18,17 @@ use codex_tools::ToolSpec;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
-const TOOL_NAME: &str = "send_user_message_async";
+const TOOL_NAME: &str = "send_message_to_user_async";
 
-pub struct SendUserMessageAsyncHandler {
-    pub description: Option<String>,
-}
+pub struct SendMessageToUserAsyncHandler;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SendUserMessageAsyncArgs {
+struct SendMessageToUserAsyncArgs {
     message: String,
 }
 
-impl ToolExecutor<ToolInvocation> for SendUserMessageAsyncHandler {
+impl ToolExecutor<ToolInvocation> for SendMessageToUserAsyncHandler {
     fn tool_name(&self) -> ToolName {
         ToolName::plain(TOOL_NAME)
     }
@@ -39,16 +37,14 @@ impl ToolExecutor<ToolInvocation> for SendUserMessageAsyncHandler {
         let properties = BTreeMap::from([(
             "message".to_string(),
             JsonSchema::string(Some(
-                "The concise question to send to the user.".to_string(),
+                "The concise question or update to send to the user.".to_string(),
             )),
         )]);
 
         ToolSpec::Function(ResponsesApiTool {
             name: TOOL_NAME.to_string(),
-            description: self.description.clone().unwrap_or_else(|| {
-                "Send a concise message that needs the user's attention during ongoing work. The tool returns immediately without ending the turn or waiting for a reply; any reply arrives asynchronously as a new user message.\nOnly use this tool to ask for missing information, preferences, constraints, clarification, or approval. The message should be concise, easy to read and understand, and at the right level of abstraction that is appropriate for the user and task at hand."
-                    .to_string()
-            }),
+            description: "Send a concise message that needs the user's attention during ongoing work. The tool returns immediately without ending the turn or waiting for a reply; any reply arrives asynchronously as a new user message. Use this tool to ask for missing information, preferences, constraints, clarification, or approval; report a critical blocker or a finding that may change the task's direction; or answer a user question or status request received while work is still in progress. Use this tool when a message needs the user's immediate attention; use commentary for routine progress and intermediate context. Use clear formatting, such as bolding questions, to make requests easy to notice and answer."
+                .to_string(),
             strict: false,
             defer_loading: None,
             parameters: JsonSchema::object(
@@ -77,7 +73,7 @@ impl ToolExecutor<ToolInvocation> for SendUserMessageAsyncHandler {
                     "{TOOL_NAME} handler received unsupported payload"
                 )));
             };
-            let args: SendUserMessageAsyncArgs = parse_arguments(&arguments)?;
+            let args: SendMessageToUserAsyncArgs = parse_arguments(&arguments)?;
             let message = args.message.trim();
             if message.is_empty() {
                 return Err(FunctionCallError::RespondToModel(
@@ -93,6 +89,7 @@ impl ToolExecutor<ToolInvocation> for SendUserMessageAsyncHandler {
                 phase: Some(MessagePhase::FinalAnswer),
                 memory_citation: None,
                 delivery: Some(AgentMessageDelivery::Async),
+                questions: None,
             });
             session.emit_turn_item_started(turn.as_ref(), &item).await;
             session.emit_turn_item_completed(turn.as_ref(), item).await;
@@ -105,7 +102,7 @@ impl ToolExecutor<ToolInvocation> for SendUserMessageAsyncHandler {
     }
 }
 
-impl CoreToolRuntime for SendUserMessageAsyncHandler {
+impl CoreToolRuntime for SendMessageToUserAsyncHandler {
     fn is_builtin_control_tool(&self) -> bool {
         true
     }

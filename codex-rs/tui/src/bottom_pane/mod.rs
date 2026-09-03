@@ -567,6 +567,11 @@ impl BottomPane {
         self.status_timer.reset(elapsed);
     }
 
+    pub(crate) fn set_status_timer_origin(&mut self, started_at: Option<Instant>) {
+        self.status_timer.display_started_at = started_at;
+        self.request_redraw();
+    }
+
     pub fn skills(&self) -> Option<&Vec<SkillMetadata>> {
         self.composer.skills()
     }
@@ -868,10 +873,10 @@ impl BottomPane {
     }
 
     fn schedule_active_view_frame(&self) {
-        if let Some(delay) = self
-            .active_view()
-            .and_then(BottomPaneView::next_frame_delay)
-        {
+        if let Some(delay) = self.active_view().map_or_else(
+            || self.composer.footer_flash_delay(),
+            BottomPaneView::next_frame_delay,
+        ) {
             self.request_redraw_in(delay);
         }
     }
@@ -1958,6 +1963,12 @@ impl BottomPane {
 
     pub(crate) fn set_status_line(&mut self, status_line: Option<Line<'static>>) {
         if self.composer.set_status_line(status_line) {
+            self.request_redraw();
+        }
+    }
+
+    pub(crate) fn set_luna_reserve_active(&mut self, active: bool) {
+        if self.composer.set_luna_reserve_active(active) {
             self.request_redraw();
         }
     }

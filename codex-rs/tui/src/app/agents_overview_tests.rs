@@ -39,6 +39,7 @@ fn overview_thread(
     status: ThreadStatus,
 ) -> Thread {
     Thread {
+        environments: None,
         id: thread_id.to_string(),
         extra: None,
         project_id: None,
@@ -168,7 +169,7 @@ async fn shared_overview_keeps_rows_and_replays_changes_over_stale_reads() -> Re
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shared_overview_seeds_once_and_retains_locally_resumed_history() -> Result<()> {
     let mut app = make_test_app().await;
     let mut ids = Vec::new();
@@ -202,6 +203,7 @@ async fn shared_overview_seeds_once_and_retains_locally_resumed_history() -> Res
     for thread_id in [ids[0], ids[21]] {
         app_server
             .resume_thread(
+                &app.local_settings,
                 config.clone(),
                 thread_id,
                 crate::app_server_session::ResumeModelSettings::PreserveExistingThread,
@@ -257,6 +259,7 @@ async fn shared_overview_seeds_once_and_retains_locally_resumed_history() -> Res
     // Opening older history is a local addition, even without starting a turn.
     let resumed = app_server
         .resume_thread(
+            &app.local_settings,
             config.clone(),
             ids[1],
             crate::app_server_session::ResumeModelSettings::PreserveExistingThread,
@@ -603,7 +606,7 @@ async fn shared_overview_shows_only_root_sessions() {
     assert!(app.last_rendered_history_tail.is_some());
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[tokio::test]
 async fn embedded_sessions_offer_to_start_a_background_server_without_migrating() {
     let mut app = make_test_app().await;
@@ -620,6 +623,47 @@ async fn embedded_sessions_offer_to_start_a_background_server_without_migrating(
         );
     });
     app_server.shutdown().await.expect("shutdown app server");
+}
+
+#[cfg(any(unix, windows))]
+#[tokio::test]
+async fn daemon_start_result_snapshots() -> Result<()> {
+    let (mut app, mut app_event_rx, _op_rx) =
+        crate::app::tests::make_test_app_with_channels().await;
+    let mut app_server =
+        crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref()).await?;
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+
+    for (name, result) in [
+        ("agents_daemon_started", Ok(())),
+        (
+            "agents_daemon_start_failed",
+            Err("The host does not allow detached processes".to_string()),
+        ),
+    ] {
+        app.handle_event(
+            &mut tui,
+            &mut app_server,
+            AppEvent::AgentsDaemonStarted { result },
+        )
+        .await?;
+        let cell = match app_event_rx.try_recv()? {
+            AppEvent::InsertHistoryCell(cell) => cell,
+            other => panic!("expected daemon result history, got {other:?}"),
+        };
+        let rendered = cell
+            .display_lines(/*width*/ 80)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        insta::with_settings!({snapshot_path => "../snapshots"}, {
+            insta::assert_snapshot!(name, rendered);
+        });
+    }
+
+    app_server.shutdown().await?;
+    Ok(())
 }
 
 #[tokio::test]
@@ -700,6 +744,45 @@ async fn failed_root_switch_keeps_background_requests_on_the_active_session() ->
 }
 
 #[tokio::test]
+async fn root_switch_loads_local_preferences_from_disk() -> Result<()> {
+    let mut app = make_test_app().await;
+    let mut app_server =
+        crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref()).await?;
+    let previous = app_server.start_thread(&app.config).await?;
+    app.enqueue_primary_thread_session(previous.session, previous.turns)
+        .await?;
+    let target_thread_id = ThreadId::from_string(
+        &app_test_support::create_fake_rollout(
+            app.config.codex_home.as_path(),
+            "2025-01-05T12-00-00",
+            "2025-01-05T12:00:00Z",
+            "Target task",
+            Some(&app.config.model_provider_id),
+            /*git_info*/ None,
+        )
+        .expect("materialize target rollout"),
+    )?;
+    std::fs::write(
+        app.local_settings.user_config_path.as_path(),
+        "[tui]\ntheme = \"dracula\"\nresume_cwd = \"session\"\n[history]\npersistence = \"none\"\n",
+    )?;
+    let config = app
+        .rebuild_config_for_cwd(app.config.cwd.to_path_buf())
+        .await?;
+    let expected = crate::local_settings::LocalSettings::from(&config);
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+
+    app.select_agents_overview_thread(&mut tui, &mut app_server, target_thread_id)
+        .await?;
+
+    assert_eq!(app.current_displayed_thread_id(), Some(target_thread_id));
+    assert_eq!(app.local_settings, expected);
+    assert_eq!(app.chat_widget.local_settings, expected);
+    app_server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn root_switch_preserves_idle_root_with_running_subagent() -> Result<()> {
     let mut app = make_test_app().await;
     let mut app_server =
@@ -721,6 +804,7 @@ async fn root_switch_preserves_idle_root_with_running_subagent() -> Result<()> {
     )?;
     let target = app_server
         .resume_thread(
+            &app.local_settings,
             app.config.clone(),
             target_thread_id,
             crate::app_server_session::ResumeModelSettings::PreserveExistingThread,
@@ -801,6 +885,7 @@ async fn overview_selection_applies_user_permissions_only_to_unloaded_threads() 
     let mut app_server = crate::start_embedded_app_server_for_picker(&server_config).await?;
     let loaded = app_server
         .resume_thread(
+            &crate::local_settings::LocalSettings::from(&server_config),
             server_config.clone(),
             thread_ids[0],
             crate::app_server_session::ResumeModelSettings::RestoreFromThread,
@@ -861,6 +946,7 @@ async fn overview_selection_applies_user_permissions_only_to_unloaded_threads() 
             .await?;
         let observed = app_server
             .resume_thread(
+                &app.local_settings,
                 app.config.clone(),
                 thread_id,
                 crate::app_server_session::ResumeModelSettings::PreserveExistingThread,
@@ -961,6 +1047,7 @@ async fn overview_cold_resume_honors_working_directory_selection() -> Result<()>
             .await?;
         let observed = app_server
             .resume_thread(
+                &app.local_settings,
                 app.config.clone(),
                 thread_id,
                 crate::app_server_session::ResumeModelSettings::PreserveExistingThread,

@@ -933,6 +933,7 @@ async fn known_thread_started_preserves_session_without_reading_unmaterialized_r
     );
     let notification = ThreadStartedNotification {
         thread: Thread {
+            environments: None,
             id: thread_id.to_string(),
             extra: None,
             session_id: thread_id.to_string(),
@@ -1207,6 +1208,7 @@ async fn owned_subagent_approval_before_thread_started_is_preserved() -> Result<
     )?;
     app_server
         .resume_thread(
+            &app.local_settings,
             app.config.clone(),
             child_thread_id,
             crate::app_server_session::ResumeModelSettings::RestoreFromThread,
