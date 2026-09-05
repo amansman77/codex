@@ -54,6 +54,7 @@ use crate::bottom_pane::TerminalTitleItem;
 use crate::chatwidget::ConnectorScopeGeneration;
 use crate::chatwidget::ThreadUsageOutcome;
 use crate::chatwidget::UserMessage;
+use crate::experimental_features::FeatureWriteResult;
 use crate::goal_files::GoalDraft;
 use codex_app_server_protocol::AskForApproval;
 use codex_config::types::ApprovalsReviewer;
@@ -200,10 +201,10 @@ pub(crate) enum TranscriptExportDestination {
 }
 
 /// Deliver a generated title to its originating automatic rename or editable prompt.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum ThreadTitleDestination {
-    /// Replace the provisional name only if the user has not renamed the thread.
-    Automatic { expected_title: String },
+    /// Name the thread only if the user has not already named it.
+    Automatic,
     /// Prefill only the still-active rename prompt with the matching request ID.
     RenameSuggestion { request_id: Uuid },
 }
@@ -218,6 +219,7 @@ pub(crate) enum RecapTrigger {
 #[derive(Debug)]
 pub(crate) struct AgentsOverviewThreadRefresh {
     pub(crate) threads: std::collections::HashMap<ThreadId, Option<Thread>>,
+    pub(crate) last_messages: std::collections::HashMap<ThreadId, String>,
     pub(crate) recent_seed_complete: bool,
 }
 
@@ -351,6 +353,7 @@ pub(crate) enum AppEvent {
     CopySelection {
         text: Arc<str>,
         label: String,
+        format: crate::clipboard_copy::CopyFormat,
     },
 
     /// Persist a submitted prompt in the cross-session message history.
@@ -1026,6 +1029,15 @@ pub(crate) enum AppEvent {
         result: Result<Vec<ModelPreset>, String>,
     },
 
+    FetchPermissionProfiles {
+        request_id: uuid::Uuid,
+        thread_cwd: Option<PathBuf>,
+    },
+    PermissionProfilesLoaded {
+        request_id: uuid::Uuid,
+        result: Result<crate::permission_discovery::PermissionDiscovery, String>,
+    },
+
     /// Open the reasoning selection popup after picking a model.
     OpenReasoningPopup {
         model: ModelPreset,
@@ -1148,9 +1160,24 @@ pub(crate) enum AppEvent {
     /// Update the current approvals reviewer in the running app and widget.
     UpdateApprovalsReviewer(ApprovalsReviewer),
 
+    /// Discover experimental features for the requesting popup only.
+    FetchExperimentalFeatures {
+        thread_id: ThreadId,
+        response_tx: tokio::sync::oneshot::Sender<
+            Result<Vec<codex_app_server_protocol::ExperimentalFeature>, String>,
+        >,
+    },
+
     /// Update feature flags and persist them to the top-level config.
     UpdateFeatureFlags {
         updates: Vec<(Feature, bool)>,
+    },
+
+    /// Save generic menu controls without changing running-task settings.
+    SaveExperimentalFeatures {
+        thread_id: ThreadId,
+        updates: Vec<(String, bool)>,
+        response_tx: tokio::sync::oneshot::Sender<Result<FeatureWriteResult, String>>,
     },
 
     /// Update memory settings and persist them to config.toml.

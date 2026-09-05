@@ -1,5 +1,8 @@
 //! Daemon-wide overview of recent and locally retained sessions and their subagents.
 
+#[path = "agents_overview_composer.rs"]
+mod composer;
+
 use super::agents_overview_view::AgentsOverviewGroup;
 use super::agents_overview_view::AgentsOverviewRow;
 use super::agents_overview_view::AgentsOverviewView;
@@ -25,6 +28,8 @@ pub(crate) const AGENTS_OVERVIEW_VIEW_ID: &str = "agents-overview";
 pub(super) struct AgentsOverviewState {
     /// Missing metadata records a local resume until the next metadata refresh.
     pub(super) threads: HashMap<ThreadId, Option<Thread>>,
+    pub(super) last_messages: HashMap<ThreadId, String>,
+    pub(super) activity: HashMap<ThreadId, super::agents_overview_details::AgentsOverviewActivity>,
     pub(super) initialized: bool,
     pub(super) request_id: Option<Uuid>,
     pub(super) refresh_pending: bool,
@@ -98,6 +103,11 @@ impl App {
             return;
         }
 
+        self.agents_overview
+            .view_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .focus_composer();
         let threads = self
             .agents_overview
             .threads
@@ -125,10 +135,15 @@ impl App {
         match result {
             Ok(refresh) => {
                 self.agents_overview.initialized = refresh.recent_seed_complete;
+                self.agents_overview
+                    .last_messages
+                    .extend(refresh.last_messages);
                 for (thread_id, thread) in refresh.threads {
                     if let Some(mut thread) = thread {
                         if thread.ephemeral {
                             self.agents_overview.threads.remove(&thread_id);
+                            self.agents_overview.last_messages.remove(&thread_id);
+                            self.agents_overview.activity.remove(&thread_id);
                             continue;
                         }
                         thread.turns.clear();
@@ -154,6 +169,13 @@ impl App {
             std::mem::take(&mut self.agents_overview.refresh_notifications).into_values()
         {
             for notification in notifications {
+                if let ServerNotification::ThreadReverted(reverted) = &notification
+                    && let Ok(thread_id) = ThreadId::from_string(&reverted.thread_id)
+                {
+                    // Discard stale read results without clearing activity received after the revert.
+                    self.agents_overview.last_messages.remove(&thread_id);
+                    continue;
+                }
                 self.track_agents_overview_notification(&notification);
             }
         }
@@ -245,12 +267,15 @@ impl App {
                 continue;
             };
             rows.push(AgentsOverviewRow {
+                details: self.agents_overview_details(root, &children),
                 thread: root.clone(),
                 thread_id,
                 group,
                 is_current: self.primary_thread_id == Some(thread_id),
             });
         }
+
+        self.sync_agents_overview_composer();
 
         AgentsOverviewView::new(
             rows,
@@ -599,9 +624,7 @@ impl App {
             Some(cwd) => match self.rebuild_config_for_cwd(cwd.to_path_buf()).await {
                 Ok(config) => config,
                 Err(error) => {
-                    if let Ok(mut state) = self.agents_overview.view_state.lock() {
-                        state.input = prompt;
-                    }
+                    self.restore_agents_overview_prompt(prompt);
                     return self
                         .chat_widget
                         .add_error_message(format!("Failed to load project settings: {error}"));
@@ -615,9 +638,7 @@ impl App {
                 || config.permissions.profile_workspace_roots()
                     != self.config.permissions.profile_workspace_roots())
         {
-            if let Ok(mut state) = self.agents_overview.view_state.lock() {
-                state.input = prompt;
-            }
+            self.restore_agents_overview_prompt(prompt);
             return self
                 .chat_widget
                 .add_error_message("Permission profile has different settings.".to_string());
@@ -631,6 +652,7 @@ impl App {
         );
         match app_server
             .start_thread_with_session_start_source(
+                &self.local_settings,
                 &config,
                 /*session_start_source*/ None,
                 remote_cwd.as_deref(),
@@ -646,9 +668,7 @@ impl App {
                     .await;
             }
             Err(error) => {
-                if let Ok(mut state) = self.agents_overview.view_state.lock() {
-                    state.input = prompt;
-                }
+                self.restore_agents_overview_prompt(prompt);
                 self.chat_widget
                     .add_error_message(format!("Failed to start background task: {error}"));
             }
@@ -676,9 +696,7 @@ impl App {
             })
             .await;
         if let Err(error) = result {
-            if let Ok(mut state) = self.agents_overview.view_state.lock() {
-                state.input = prompt;
-            }
+            self.restore_agents_overview_prompt(prompt);
             self.chat_widget
                 .add_error_message(format!("Failed to send task message: {error}"));
         }

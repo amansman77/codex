@@ -217,6 +217,7 @@ impl ChatWidget {
         // Account-update notifications are the identity boundary. The visible account fields can
         // be identical across two accounts, so always invalidate account-scoped requests and data.
         self.model_popup_request_id = None;
+        self.invalidate_permission_discovery();
         self.invalidate_connector_scope();
         self.clear_pending_token_activity_refreshes();
         self.clear_pending_rate_limit_reset_requests();
@@ -441,6 +442,8 @@ impl ChatWidget {
     pub(super) fn refresh_model_display(&mut self) {
         let effective = self.effective_collaboration_mode();
         self.session_header.set_model(effective.model());
+        self.bottom_pane
+            .set_astra_sparkle(effective.model(), &self.local_settings.tui);
         // Keep composer paste affordances aligned with the currently effective model.
         self.sync_image_paste_enabled();
         self.sync_service_tier_commands();
@@ -466,6 +469,7 @@ impl ChatWidget {
     }
 
     fn apply_thread_settings(&mut self, mut settings: ThreadSettings) {
+        self.invalidate_permission_discovery();
         let cwd_changed = self.config.cwd != settings.cwd;
         self.apply_thread_settings_cwd(settings.cwd.clone());
         self.config.model_provider_id = settings.model_provider.clone();

@@ -1,26 +1,151 @@
 //! Layout rendering and cursor placement for the agent dashboard.
+//! The prompt and its cursor reserve the same height for wrapped footer hints.
 
 use super::*;
+use crossterm::cursor::SetCursorStyle;
+
+impl AgentsOverviewView {
+    pub(super) fn footer_lines(&self, width: u16) -> Vec<Line<'static>> {
+        if self.state().connection_notice.is_some() {
+            return vec![
+                "ctrl+c clear input, then quit · actions paused until the list is refreshed"
+                    .dim()
+                    .into(),
+            ];
+        }
+        let list_hint = |action| {
+            self.keymap.primary_hint(action).filter(|hint| {
+                !matches!(hint, ShortcutHint::Single(binding)
+                if is_plain_text_key_event(KeyEvent::new(
+                    binding.parts().0,
+                    binding.parts().1,
+                )) || [
+                    &self.agents_keymap.resume,
+                    &self.agents_keymap.search,
+                    &self.agents_keymap.new_task,
+                    &self.agents_keymap.rename,
+                    &self.agents_keymap.stop,
+                    &self.agents_keymap.toggle_grouping,
+                ]
+                .into_iter()
+                .any(|bindings| bindings.contains(binding)))
+            })
+        };
+        let navigation_hints = [ListAction::MoveUp, ListAction::MoveDown]
+            .into_iter()
+            .filter_map(list_hint)
+            .map(|hint| hint.display_label().replace(" + ", "+"))
+            .collect::<Vec<_>>();
+        let navigation_hint = navigation_hints.join(
+            if navigation_hints
+                .iter()
+                .all(|hint| hint.chars().count() == 1)
+            {
+                ""
+            } else {
+                " "
+            },
+        );
+        let mut footer_spans = Vec::new();
+        if !navigation_hint.is_empty() {
+            footer_spans.extend([navigation_hint.bold(), " navigate  ".dim()]);
+        }
+        let mut add_hint = |hint: Option<ShortcutHint>, label: &'static str, enabled: bool| {
+            if let Some(hint) = hint {
+                let key = hint.display_label().replace(" + ", "+");
+                footer_spans.push(if enabled { key.bold() } else { key.dim() });
+                footer_spans.push(format!(" {label}  ").dim());
+            }
+        };
+        add_hint(
+            self.agents_keymap
+                .primary_hint("resume", &self.agents_keymap.resume),
+            "resume",
+            true,
+        );
+        add_hint(list_hint(ListAction::Accept), "open", true);
+        add_hint(
+            self.agents_keymap
+                .primary_hint("new_task", &self.agents_keymap.new_task),
+            "new task",
+            true,
+        );
+        add_hint(
+            self.agents_keymap
+                .primary_hint("search", &self.agents_keymap.search),
+            "search",
+            true,
+        );
+        add_hint(
+            self.agents_keymap
+                .primary_hint("toggle_grouping", &self.agents_keymap.toggle_grouping),
+            "group",
+            true,
+        );
+        add_hint(
+            self.agents_keymap
+                .primary_hint("rename", &self.agents_keymap.rename),
+            "rename",
+            true,
+        );
+        add_hint(
+            self.agents_keymap
+                .primary_hint("stop", &self.agents_keymap.stop),
+            "stop",
+            self.selected_row()
+                .is_some_and(|row| matches!(row.thread.status, ThreadStatus::Active { .. })),
+        );
+        add_hint(list_hint(ListAction::Cancel), "back", true);
+        let mut footer_line: Line = footer_spans.into();
+        if footer_line.width() > usize::from(width) {
+            for span in &mut footer_line.spans {
+                if span.content.ends_with("  ") {
+                    span.content.to_mut().pop();
+                }
+            }
+        }
+        crate::wrapping::word_wrap_lines([footer_line], usize::from(width))
+    }
+}
 
 impl Renderable for AgentsOverviewView {
     fn desired_height(&self, _width: u16) -> u16 {
         24
     }
 
+    fn cursor_style(&self, area: Rect) -> SetCursorStyle {
+        let state = self.state();
+        if state.composing()
+            && let Some(composer) = &state.composer
+        {
+            composer.cursor_style(area)
+        } else {
+            SetCursorStyle::DefaultUserShape
+        }
+    }
+
     fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)> {
-        let state = self.state().clone();
+        if area.width < 12 || area.height < 8 {
+            return None;
+        }
+        let [_, _, _, _, _, prompt, _] = self.layout_areas(area);
+        let state = self.state();
+        if state.composing() {
+            return state.composer.as_ref()?.cursor_pos(prompt);
+        }
+        if !state.editing_metadata() {
+            return None;
+        }
         let (label, input) = if state.searching {
             ("  Search › ", &state.search)
-        } else if state.renaming {
-            ("  Rename › ", &state.input)
         } else {
-            ("  New task › ", &state.input)
+            ("  Rename › ", &state.input)
         };
         let x = area
             .x
             .saturating_add((label.width() + input.width()) as u16)
             .min(area.right().saturating_sub(3));
-        Some((x, area.bottom().saturating_sub(2)))
+        Some((x, prompt.y))
     }
 
     fn render(&self, area: Rect, buf: &mut Buffer) {
@@ -28,15 +153,7 @@ impl Renderable for AgentsOverviewView {
             return;
         }
         Clear.render(area, buf);
-        let [header, summary, divider, body, prompt, footer] = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Min(3),
-            Constraint::Length(1),
-            Constraint::Length(1),
-        ])
-        .areas(area);
+        let [header, summary, divider, body, title, prompt, footer] = self.layout_areas(area);
         let inset =
             |rect: Rect| rect.inner(Margin::new(/*horizontal*/ 2, /*vertical*/ 0));
         Line::from("Agent command center".bold()).render(inset(header), buf);
@@ -76,18 +193,11 @@ impl Renderable for AgentsOverviewView {
         } else {
             self.render_rows(body, buf);
         }
-        let state = self.state().clone();
+        let state = self.state();
         let (label, input) = if state.searching {
             ("Search › ", &state.search)
-        } else if state.renaming {
+        } else {
             ("Rename › ", &state.input)
-        } else {
-            ("New task › ", &state.input)
-        };
-        let placeholder = if input.is_empty() && !state.searching && !state.renaming {
-            "Describe a task and press enter to dispatch it"
-        } else {
-            ""
         };
         let available_width = usize::from(inset(prompt).width)
             .saturating_sub(label.width())
@@ -102,93 +212,19 @@ impl Renderable for AgentsOverviewView {
             visible_width += width;
             visible_start = index;
         }
-        let input = &input[visible_start..];
-        Line::from(vec![label.cyan().bold(), input.into(), placeholder.dim()])
-            .render(inset(prompt), buf);
-        if state.connection_notice.is_some() {
-            Line::from("ctrl+c quit · actions paused until the list is refreshed".dim())
-                .render(inset(footer), buf);
+        if state.editing_metadata() {
+            Line::from(vec![label.cyan().bold(), input[visible_start..].into()])
+                .render(inset(prompt), buf);
+        } else {
+            Line::from("New task".dim()).render(inset(title), buf);
+            if let Some(composer) = &state.composer {
+                composer.render(prompt, buf);
+            }
+        }
+        if state.composing() {
             return;
         }
-        let list_hint = |action| {
-            self.keymap.primary_hint(action).filter(|hint| {
-                !matches!(hint, ShortcutHint::Single(binding)
-                if is_plain_text_key_event(KeyEvent::new(
-                    binding.parts().0,
-                    binding.parts().1,
-                )) || [
-                    &self.agents_keymap.search,
-                    &self.agents_keymap.new_task,
-                    &self.agents_keymap.rename,
-                    &self.agents_keymap.stop,
-                    &self.agents_keymap.toggle_grouping,
-                ]
-                .into_iter()
-                .any(|bindings| bindings.contains(binding)))
-            })
-        };
-        let navigation_hints = [ListAction::MoveUp, ListAction::MoveDown]
-            .into_iter()
-            .filter_map(list_hint)
-            .map(|hint| hint.display_label().replace(" + ", "+"))
-            .collect::<Vec<_>>();
-        let navigation_hint = navigation_hints.join(
-            if navigation_hints
-                .iter()
-                .all(|hint| hint.chars().count() == 1)
-            {
-                ""
-            } else {
-                " "
-            },
-        );
-        let mut footer_spans = Vec::new();
-        if !navigation_hint.is_empty() {
-            footer_spans.extend([navigation_hint.bold(), " navigate  ".dim()]);
-        }
-        let mut add_hint = |hint: Option<ShortcutHint>, label: &'static str, enabled: bool| {
-            if let Some(hint) = hint {
-                let key = hint.display_label().replace(" + ", "+");
-                footer_spans.push(if enabled { key.bold() } else { key.dim() });
-                footer_spans.push(format!(" {label}  ").dim());
-            }
-        };
-        add_hint(list_hint(ListAction::Accept), "open", true);
-        add_hint(
-            self.agents_keymap
-                .primary_hint("search", &self.agents_keymap.search),
-            "search",
-            true,
-        );
-        add_hint(
-            self.agents_keymap
-                .primary_hint("toggle_grouping", &self.agents_keymap.toggle_grouping),
-            "group",
-            true,
-        );
-        add_hint(
-            self.agents_keymap
-                .primary_hint("rename", &self.agents_keymap.rename),
-            "rename",
-            true,
-        );
-        add_hint(
-            self.agents_keymap
-                .primary_hint("stop", &self.agents_keymap.stop),
-            "stop",
-            self.selected_row()
-                .is_some_and(|row| matches!(row.thread.status, ThreadStatus::Active { .. })),
-        );
-        add_hint(list_hint(ListAction::Cancel), "back", true);
-        let footer_area = inset(footer);
-        let mut footer_line: Line = footer_spans.into();
-        if footer_line.width() > usize::from(footer_area.width) {
-            for span in &mut footer_line.spans {
-                if span.content.ends_with("  ") {
-                    span.content.to_mut().pop();
-                }
-            }
-        }
-        footer_line.render(footer_area, buf);
+        drop(state);
+        Paragraph::new(self.footer_lines(inset(footer).width)).render(inset(footer), buf);
     }
 }
