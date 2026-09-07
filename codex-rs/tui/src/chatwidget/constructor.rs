@@ -98,6 +98,7 @@ impl ChatWidget {
             pet_http_client.clone(),
         );
         let mut widget = Self {
+            cyber_policy_notice: Default::default(),
             app_event_tx: app_event_tx.clone(),
             frame_requester: frame_requester.clone(),
             codex_op_target,
@@ -125,6 +126,9 @@ impl ChatWidget {
             has_codex_backend_auth,
             model_catalog,
             model_popup_request_id: None,
+            permission_popup_request_id: None,
+            worktree_popup_request_id: None,
+            permission_profiles_menu_opened: false,
             model_popup_model_ids: Vec::new(),
             session_telemetry,
             session_header: SessionHeader::new(header_model),
@@ -132,6 +136,7 @@ impl ChatWidget {
             status_account_display,
             runtime_model_provider_base_url,
             remote_connection: None,
+            local_worktree_operations: true,
             token_info: None,
             token_usage_pending: false,
             rate_limit_snapshots_by_limit_id: BTreeMap::new(),
@@ -210,10 +215,10 @@ impl ChatWidget {
             pet_image_support_override: None,
             thread_id: None,
             thread_name: None,
-            pending_automatic_thread_names: HashSet::new(),
             thread_rename_block_message: None,
             active_side_conversation: false,
             blocks_direct_input: false,
+            external_writer_view: false,
             misalignment_policy_violation: None,
             normal_placeholder_text: placeholder,
             side_placeholder_text: side_placeholder,
@@ -285,6 +290,7 @@ impl ChatWidget {
             .set_collaboration_modes_enabled(/*enabled*/ true);
         widget.sync_service_tier_commands();
         widget.sync_personality_command_enabled();
+        widget.sync_worktrees_enabled();
         widget.sync_plugins_command_enabled();
         widget.sync_goal_command_enabled();
         widget.sync_mentions_v2_enabled();
@@ -307,6 +313,10 @@ impl ChatWidget {
             .bottom_pane
             .set_token_activity_command_enabled(widget.has_codex_backend_auth);
         widget.refresh_status_surfaces();
+        widget.bottom_pane.set_astra_sparkle(
+            widget.effective_collaboration_mode().model(),
+            &widget.local_settings.tui,
+        );
 
         widget
     }

@@ -29,6 +29,7 @@ use rmcp::model::CallToolRequestParams;
 use rmcp::model::CallToolResult;
 use rmcp::model::ClientNotification;
 use rmcp::model::ClientRequest;
+use rmcp::model::ContentBlock;
 use rmcp::model::CustomNotification;
 use rmcp::model::CustomRequest;
 use rmcp::model::ElicitRequestParams;
@@ -39,6 +40,7 @@ use rmcp::model::InitializeRequestParams;
 use rmcp::model::ListResourceTemplatesResult;
 use rmcp::model::ListResourcesResult;
 use rmcp::model::ListToolsResult;
+use rmcp::model::MetaObject;
 use rmcp::model::PaginatedRequestParams;
 use rmcp::model::ProtocolVersion;
 use rmcp::model::ReadResourceRequestParams;
@@ -54,6 +56,7 @@ use rmcp::service::ClientServiceExt;
 use rmcp::service::RequestHandle;
 use rmcp::service::RoleClient;
 use rmcp::service::RunningService;
+use rmcp::service::ServiceError;
 use rmcp::transport::AuthorizationManager;
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::auth::AuthClient;
@@ -191,7 +194,7 @@ pub(crate) struct ElicitationPauseState {
 }
 
 impl ElicitationPauseState {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let (paused, _rx) = watch::channel(false);
         Self {
             active_count: Arc::new(AtomicUsize::new(0)),
@@ -311,6 +314,11 @@ pub enum Elicitation {
         message: String,
         requested_schema: serde_json::Value,
     },
+    UserVerification {
+        title: String,
+        description: String,
+        challenge: String,
+    },
 }
 
 impl Elicitation {
@@ -320,6 +328,7 @@ impl Elicitation {
             Self::OpenAiForm { meta, .. } | Self::OpenAiElicitationForm { meta, .. } => {
                 meta.as_ref().and_then(serde_json::Value::as_object)
             }
+            Self::UserVerification { .. } => None,
         }
     }
 }
@@ -811,7 +820,7 @@ impl RmcpClient {
         let mut rmcp_params = CallToolRequestParams::new(name);
         rmcp_params.arguments = arguments;
         let requested_modern = self.protocol_mode == McpProtocolMode::V20260728;
-        let result = self
+        match self
             .run_service_operation("tools/call", timeout, move |service| {
                 let mut rmcp_params = rmcp_params.clone();
                 let meta = meta.clone();
@@ -844,9 +853,36 @@ impl RmcpClient {
                 }
                 .boxed()
             })
-            .await?;
-        self.persist_oauth_tokens().await;
-        Ok(result)
+            .await
+        {
+            Ok(result) => {
+                self.persist_oauth_tokens().await;
+                Ok(result)
+            }
+            Err(error) => {
+                let Some(ClientOperationError::Service(ServiceError::TransportSend(transport))) =
+                    error.downcast_ref()
+                else {
+                    return Err(error);
+                };
+                let Some(StreamableHttpError::AuthRequired(challenge)) =
+                    transport
+                        .error
+                        .downcast_ref::<StreamableHttpError<StreamableHttpClientAdapterError>>()
+                else {
+                    return Err(error);
+                };
+                // The transport has already handled automatic refresh. Preserve the challenge
+                // for interactive login without replaying the rejected tool call.
+                let mut result =
+                    CallToolResult::error(vec![ContentBlock::text("Authentication required")]);
+                result.meta = Some(MetaObject::from(serde_json::Map::from_iter([(
+                    "mcp/www_authenticate".to_string(),
+                    serde_json::json!([challenge.www_authenticate_header]),
+                )])));
+                Ok(result)
+            }
+        }
     }
 
     pub async fn send_custom_notification(
@@ -1603,6 +1639,10 @@ async fn create_oauth_transport_and_runtime(
         oauth_runtime: runtime,
     })
 }
+
+#[cfg(test)]
+#[path = "user_verification_cancellation_tests.rs"]
+mod user_verification_cancellation_tests;
 
 #[cfg(test)]
 mod tests {

@@ -1,5 +1,8 @@
 //! App-level orchestration tests for the TUI.
 
+#[path = "tests/daybreak_tests.rs"]
+mod daybreak_tests;
+
 #[path = "tests/advanced_reasoning_tests.rs"]
 mod advanced_reasoning_tests;
 #[path = "tests/agents_navigation_tests.rs"]
@@ -12,6 +15,8 @@ mod backend_banner_recovery_tests;
 mod backend_banner_startup_tests;
 #[path = "tests/background_exit_tests.rs"]
 mod background_exit_tests;
+#[path = "tests/background_task_defaults_tests.rs"]
+mod background_task_defaults_tests;
 #[path = "tests/buffered_replay.rs"]
 mod buffered_replay;
 #[path = "tests/connector_policy.rs"]
@@ -27,6 +32,8 @@ mod mcp_startup;
 #[path = "tests/misalignment_policy_tests.rs"]
 mod misalignment_policy;
 mod model_catalog;
+#[path = "tests/model_defaults_tests.rs"]
+mod model_defaults;
 #[path = "tests/patch_approval_tests.rs"]
 mod patch_approval_tests;
 #[path = "tests/permission_shortcuts_tests.rs"]
@@ -40,6 +47,8 @@ mod safety_buffering;
 mod session_lifecycle_requests;
 mod session_summary;
 mod startup;
+#[path = "tests/startup_warnings_tests.rs"]
+mod startup_warnings_tests;
 #[path = "tests/stream_animation_tests.rs"]
 mod stream_animation_tests;
 #[path = "tests/thread_usage.rs"]
@@ -54,6 +63,12 @@ use crate::app_backtrack::BacktrackSelection;
 use crate::app_backtrack::BacktrackState;
 use crate::app_backtrack::user_count;
 use crate::app_event::HistoryBatchEntryResponse;
+
+async fn drain_managed_worktree_start(app: &mut App, server: &mut AppServerSession) {
+    if let Some((mode, name)) = app.pending_start_managed_worktree.take() {
+        app.start_managed_worktree(server, mode, name).await;
+    }
+}
 use codex_utils_absolute_path::test_support::PathExt;
 
 use crate::chatwidget::ChatWidgetInit;
@@ -204,6 +219,97 @@ async fn pasted_text_normalizes_mixed_line_endings_at_app_boundary() -> Result<(
 }
 
 #[tokio::test]
+async fn duplicate_named_resume_renders_error_without_replacing_current_session() -> Result<()> {
+    let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+    let label = format!("duplicate-{}", ThreadId::new());
+    let runtime = codex_state::StateRuntime::init(
+        app.config.sqlite.clone(),
+        app.config.model_provider_id.clone(),
+    )
+    .await
+    .map_err(std::io::Error::other)?;
+    runtime
+        .mark_backfill_complete(/*last_watermark*/ None)
+        .await
+        .map_err(std::io::Error::other)?;
+    let mut thread_ids = Vec::new();
+    for _ in 0..2 {
+        let filename_ts = "2025-02-01T10-00-00";
+        let timestamp = "2025-02-01T10:00:00Z";
+        let thread_id = app_test_support::create_fake_rollout(
+            app.config.codex_home.as_path(),
+            filename_ts,
+            timestamp,
+            &label,
+            Some(&app.config.model_provider_id),
+            /*git_info*/ None,
+        )
+        .expect("materialized rollout should be created");
+        let path = app_test_support::rollout_path(
+            app.config.codex_home.as_path(),
+            filename_ts,
+            &thread_id,
+        );
+        let thread_id = ThreadId::from_string(&thread_id)?;
+        thread_ids.push(thread_id);
+        let created_at =
+            chrono::DateTime::parse_from_rfc3339(timestamp)?.with_timezone(&chrono::Utc);
+        let mut metadata = codex_state::ThreadMetadataBuilder::new(
+            thread_id,
+            path.to_path_buf(),
+            created_at,
+            serde_json::from_value(serde_json::json!("cli"))?,
+        )
+        .build(&app.config.model_provider_id);
+        metadata.title = label.clone();
+        metadata.first_user_message = Some(label.clone());
+        metadata.preview = Some(label.clone());
+        runtime
+            .upsert_thread(&metadata)
+            .await
+            .map_err(std::io::Error::other)?;
+    }
+
+    let current = ThreadId::new();
+    app.active_thread_id = Some(current);
+    app.transcript_cells = vec![plain_line_cell("Existing conversation")];
+    let mut app_server = crate::start_embedded_app_server_for_picker(&app.config).await?;
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    app.handle_event(
+        &mut tui,
+        &mut app_server,
+        AppEvent::ResumeSessionByIdOrName(label.clone()),
+    )
+    .await?;
+    while let Ok(event) = app_event_rx.try_recv() {
+        if let AppEvent::InsertHistoryCell(cell) = event {
+            app.transcript_cells.push(Arc::from(cell));
+        }
+    }
+    let rendered = app
+        .render_transcript_lines_for_reflow(/*width*/ 80)
+        .lines
+        .iter()
+        .map(rendered_line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        thread_ids
+            .iter()
+            .all(|id| rendered.contains(&id.to_string()))
+    );
+    let rendered = thread_ids
+        .iter()
+        .fold(rendered.replace(&label, "duplicate-label"), |text, id| {
+            text.replace(&id.to_string(), "<session UUID>")
+        });
+    assert_app_snapshot!("duplicate_named_resume_error", rendered);
+    assert_eq!(app.active_thread_id, Some(current));
+    app_server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn chat_widget_frame_reuses_active_cell_height_across_frame_passes() {
     #[derive(Debug)]
     struct CountingHistoryCell {
@@ -278,6 +384,7 @@ async fn handle_mcp_inventory_result_respects_origin_thread() {
 
     app.handle_mcp_inventory_result(
         Ok(vec![McpServerStatus {
+            tools_error: None,
             name: "docs".to_string(),
             runtime_status: None,
             plugin_id: None,
@@ -560,11 +667,7 @@ async fn resolved_buffered_approval_does_not_become_actionable_after_drain() -> 
     Ok(())
 }
 
-#[tokio::test]
-async fn enqueue_primary_thread_session_replays_turns_before_initial_prompt_submit() -> Result<()> {
-    let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
-    let thread_id = ThreadId::new();
-    let initial_prompt = "follow-up after replay".to_string();
+fn set_test_initial_prompt(app: &mut App, initial_prompt: String) {
     let config = app.config.clone();
     let model = get_model_offline_for_tests(config.model.as_deref());
     app.chat_widget = ChatWidget::new_with_app_event(ChatWidgetInit {
@@ -575,7 +678,7 @@ async fn enqueue_primary_thread_session_replays_turns_before_initial_prompt_subm
         app_event_tx: app.app_event_tx.clone(),
         workspace_command_runner: None,
         initial_user_message: create_initial_user_message(
-            Some(initial_prompt.clone()),
+            Some(initial_prompt),
             Vec::new(),
             Vec::new(),
         ),
@@ -594,6 +697,14 @@ async fn enqueue_primary_thread_session_replays_turns_before_initial_prompt_subm
         terminal_title_invalid_items_warned: app.terminal_title_invalid_items_warned.clone(),
         session_telemetry: app.session_telemetry.clone(),
     });
+}
+
+#[tokio::test]
+async fn enqueue_primary_thread_session_replays_turns_before_initial_prompt_submit() -> Result<()> {
+    let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+    let thread_id = ThreadId::new();
+    let initial_prompt = "follow-up after replay".to_string();
+    set_test_initial_prompt(&mut app, initial_prompt.clone());
 
     app.enqueue_primary_thread_session(
         test_thread_session(thread_id, test_path_buf("/tmp/project")),
@@ -694,7 +805,16 @@ async fn history_lookup_response_is_routed_to_requesting_thread() -> Result<()> 
     let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
     let thread_id = ThreadId::new();
 
-    app.lookup_message_history_entry(thread_id, /*offset*/ 0, /*log_id*/ 1)
+    let local_home = tempfile::tempdir()?;
+    app.local_settings.codex_home = AbsolutePathBuf::from_absolute_path(local_home.path())?;
+    let history_config = codex_message_history::HistoryConfig::new(
+        app.local_settings.codex_home.clone(),
+        &app.local_settings.history,
+    );
+    codex_message_history::append_entry("local prompt", thread_id, &history_config).await?;
+    let (log_id, _) = codex_message_history::history_metadata(&history_config).await;
+
+    app.lookup_message_history_entry(thread_id, /*offset*/ 0, log_id)
         .await?;
 
     let app_event = tokio::time::timeout(Duration::from_secs(1), app_event_rx.recv())
@@ -714,13 +834,13 @@ async fn history_lookup_response_is_routed_to_requesting_thread() -> Result<()> 
         event,
         HistoryLookupResponse::Entry {
             offset: 0,
-            log_id: 1,
-            entry: None,
+            log_id,
+            entry: Some("local prompt".to_string()),
         }
     );
 
-    let cursor = codex_message_history::HistoryBatchCursor::new(/*end_offset*/ 10);
-    app.lookup_message_history_batch(thread_id, cursor, /*log_id*/ 1)
+    let cursor = codex_message_history::HistoryBatchCursor::new(/*end_offset*/ 1);
+    app.lookup_message_history_batch(thread_id, cursor, log_id)
         .await?;
     let app_event = tokio::time::timeout(Duration::from_secs(1), app_event_rx.recv())
         .await
@@ -736,7 +856,15 @@ async fn history_lookup_response_is_routed_to_requesting_thread() -> Result<()> 
     assert_eq!(routed_thread_id, thread_id);
     assert_eq!(
         event,
-        HistoryLookupResponse::BatchError { cursor, log_id: 1 }
+        HistoryLookupResponse::Batch {
+            cursor,
+            log_id,
+            entries: vec![HistoryBatchEntryResponse {
+                offset: 0,
+                entry: Some("local prompt".to_string()),
+            }],
+            next_older_cursor: None,
+        }
     );
 
     Ok(())
@@ -2629,7 +2757,7 @@ async fn select_uncached_agent_thread_still_refreshes_liveness() -> Result<()> {
 }
 
 #[tokio::test]
-async fn open_agent_picker_prompts_to_enable_multi_agent_when_disabled() -> Result<()> {
+async fn open_agent_picker_prompts_when_subagents_disabled() -> Result<()> {
     let (mut app, mut app_event_rx, _op_rx) = Box::pin(make_test_app_with_channels()).await;
     let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(
         app.chat_widget.config_ref(),
@@ -2639,24 +2767,8 @@ async fn open_agent_picker_prompts_to_enable_multi_agent_when_disabled() -> Resu
     let _ = app.config.features.disable(Feature::Collab);
 
     Box::pin(app.open_agent_picker(&mut app_server)).await;
-    app.chat_widget
-        .handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-
-    assert_matches!(
-        app_event_rx.try_recv(),
-        Ok(AppEvent::UpdateFeatureFlags { updates }) if updates == vec![(Feature::Collab, true)]
-    );
-    let cell = match app_event_rx.try_recv() {
-        Ok(AppEvent::InsertHistoryCell(cell)) => cell,
-        other => panic!("expected InsertHistoryCell event, got {other:?}"),
-    };
-    let rendered = cell
-        .display_lines(/*width*/ 120)
-        .into_iter()
-        .map(|line| line.to_string())
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(rendered.contains("Subagents will be enabled in the next session."));
+    assert!(app.chat_widget.has_active_view());
+    assert!(app_event_rx.try_recv().is_err());
     Ok(())
 }
 
@@ -4041,6 +4153,7 @@ async fn inactive_thread_started_notification_initializes_replay_session() -> Re
         agent_thread_id,
         ServerNotification::ThreadStarted(ThreadStartedNotification {
             thread: Thread {
+                originator: None,
                 environments: None,
                 id: agent_thread_id.to_string(),
                 extra: None,
@@ -4052,6 +4165,7 @@ async fn inactive_thread_started_notification_initializes_replay_session() -> Re
                 section: None,
                 section_entered_at: None,
                 project_id: None,
+                daybreak_enabled: None,
                 history_mode: Default::default(),
                 model_provider: "agent-provider".to_string(),
                 model: None,
@@ -4143,6 +4257,7 @@ async fn inactive_thread_started_notification_preserves_primary_model_when_path_
         agent_thread_id,
         ServerNotification::ThreadStarted(ThreadStartedNotification {
             thread: Thread {
+                originator: None,
                 environments: None,
                 id: agent_thread_id.to_string(),
                 extra: None,
@@ -4154,6 +4269,7 @@ async fn inactive_thread_started_notification_preserves_primary_model_when_path_
                 section: None,
                 section_entered_at: None,
                 project_id: None,
+                daybreak_enabled: None,
                 history_mode: Default::default(),
                 model_provider: "agent-provider".to_string(),
                 model: None,
@@ -4212,6 +4328,7 @@ async fn thread_read_session_state_does_not_reuse_primary_permission_profile() {
     app.primary_session_configured = Some(primary_session);
 
     let thread = Thread {
+        originator: None,
         environments: None,
         id: read_thread_id.to_string(),
         extra: None,
@@ -4223,6 +4340,7 @@ async fn thread_read_session_state_does_not_reuse_primary_permission_profile() {
         section: None,
         section_entered_at: None,
         project_id: None,
+        daybreak_enabled: None,
         history_mode: Default::default(),
         model_provider: "read-provider".to_string(),
         model: None,
@@ -4843,7 +4961,9 @@ async fn primary_thread_ignores_child_mcp_startup_notifications() {
     let mut rendered_cells = Vec::new();
     while let Ok(event) = app_event_rx.try_recv() {
         if let AppEvent::InsertHistoryCell(cell) = event {
-            rendered_cells.push(lines_to_single_string(&cell.display_lines(/*width*/ 120)));
+            rendered_cells.push(lines_to_single_string(
+                &cell.transcript_lines(/*width*/ 120),
+            ));
         }
     }
     let rendered = rendered_cells.join("\n");
@@ -4960,12 +5080,24 @@ async fn active_side_thread_renders_live_mcp_startup_notifications() {
         app.handle_thread_event_now(event);
     }
 
+    let mut tui = crate::tui::test_support::make_test_tui().expect("test tui");
     let mut rendered_cells = Vec::new();
     while let Ok(event) = app_event_rx.try_recv() {
         if let AppEvent::InsertHistoryCell(cell) = event {
-            rendered_cells.push(lines_to_single_string(&cell.display_lines(/*width*/ 120)));
+            rendered_cells.push(lines_to_single_string(
+                &cell.transcript_lines(/*width*/ 120),
+            ));
+            app.insert_history_cell(&mut tui, cell);
         }
     }
+    let inline = app
+        .transcript_cells
+        .iter()
+        .flat_map(|cell| cell.display_lines(/*width*/ 120))
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(inline.contains("1 MCP startup issue"));
     let rendered = rendered_cells.join("\n");
     assert!(app.chat_widget.side_conversation_active());
     assert_eq!(rendered.matches("sentry is not logged in").count(), 1);
@@ -5441,6 +5573,7 @@ async fn make_test_app() -> App {
     let session_telemetry = test_session_telemetry(&config, model.as_str());
 
     App {
+        feature_write_lock: Arc::default(),
         model_catalog: chat_widget.model_catalog(),
         session_telemetry,
         app_event_tx,
@@ -5487,6 +5620,7 @@ async fn make_test_app() -> App {
         windows_sandbox: WindowsSandboxState::default(),
         thread_event_channels: HashMap::new(),
         temporary_structured_requests: HashMap::new(),
+        pending_thread_titles: HashSet::new(),
         thread_event_listener_tasks: HashMap::new(),
         agent_navigation: AgentNavigationState::default(),
         agents_overview: Default::default(),
@@ -5502,6 +5636,11 @@ async fn make_test_app() -> App {
         dynamic_tool_status_updates: tokio::sync::broadcast::channel(/*capacity*/ 64).0,
         dynamic_tool_tasks: HashMap::new(),
         pending_startup_thread_start: false,
+        pending_managed_worktree_creation: false,
+        pending_start_managed_worktree: None,
+        pending_managed_worktree_created: None,
+        pending_managed_worktree_transition: None,
+        pending_managed_worktree_attach: None,
         startup_protected_input_boundary: false,
         startup_pending_protected_request: false,
         rate_limit_hard_stop_generation: 0,
@@ -5525,6 +5664,7 @@ pub(super) async fn make_test_app_with_channels() -> (
 
     (
         App {
+            feature_write_lock: Arc::default(),
             model_catalog: chat_widget.model_catalog(),
             session_telemetry,
             app_event_tx,
@@ -5571,6 +5711,7 @@ pub(super) async fn make_test_app_with_channels() -> (
             windows_sandbox: WindowsSandboxState::default(),
             thread_event_channels: HashMap::new(),
             temporary_structured_requests: HashMap::new(),
+            pending_thread_titles: HashSet::new(),
             thread_event_listener_tasks: HashMap::new(),
             agent_navigation: AgentNavigationState::default(),
             agents_overview: Default::default(),
@@ -5586,6 +5727,11 @@ pub(super) async fn make_test_app_with_channels() -> (
             dynamic_tool_status_updates: tokio::sync::broadcast::channel(/*capacity*/ 64).0,
             dynamic_tool_tasks: HashMap::new(),
             pending_startup_thread_start: false,
+            pending_managed_worktree_creation: false,
+            pending_start_managed_worktree: None,
+            pending_managed_worktree_created: None,
+            pending_managed_worktree_transition: None,
+            pending_managed_worktree_attach: None,
             startup_protected_input_boundary: false,
             startup_pending_protected_request: false,
             rate_limit_hard_stop_generation: 0,
@@ -5923,6 +6069,49 @@ async fn resize_reflow_wraps_transcript_early_when_pet_is_enabled() {
         with_pet.lines.len() > without_pet.lines.len(),
         "expected pet-enabled transcript reflow to wrap earlier"
     );
+}
+
+#[tokio::test]
+async fn closing_fullscreen_inline_overlay_restores_history_once() -> Result<()> {
+    let (mut app, _rx, _op_rx) = make_test_app_with_channels().await;
+    app.transcript_cells = vec![plain_line_cell("Previous conversation")];
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    tui.set_alt_screen_enabled(/*enabled*/ false);
+    let screen_size = tui.terminal.last_known_screen_size;
+    tui.insert_history_lines(vec![Line::from("Previous conversation")]);
+    app.render_chat_widget_frame(&mut tui, screen_size)?;
+
+    // Content-height popups keep the existing history without rebuilding scrollback.
+    let popup_height = screen_size.height - 1;
+    tui.draw(popup_height, |_| {})?;
+    app.render_chat_widget_frame(&mut tui, screen_size)?;
+    assert!(app.last_rendered_history_tail.is_none());
+
+    tui.enter_alt_screen()?;
+    tui.draw(screen_size.height, |_| {})?;
+    tui.leave_alt_screen()?;
+    app.render_chat_widget_frame(&mut tui, screen_size)?;
+
+    assert!(tui.terminal.viewport_area.height < screen_size.height);
+    assert!(tui.terminal.viewport_area.y > 0);
+    let tail = app
+        .last_rendered_history_tail
+        .as_ref()
+        .expect("fullscreen exit rebuilt history");
+    assert_snapshot!(
+        tail.lines
+            .iter()
+            .map(rendered_line_text)
+            .collect::<Vec<_>>()
+            .join("\n"),
+        @"Previous conversation"
+    );
+
+    let deferred = vec![Line::from("Pending history").into()];
+    app.deferred_history_lines = deferred.clone();
+    app.render_chat_widget_frame(&mut tui, screen_size)?;
+    assert_eq!(app.deferred_history_lines, deferred);
+    Ok(())
 }
 
 #[tokio::test]

@@ -16,15 +16,19 @@ use codex_app_server_protocol::WarningNotification;
 
 impl App {
     pub(super) async fn shutdown_current_thread(&mut self, app_server: &mut AppServerSession) {
-        let side_thread_ids: Vec<ThreadId> = self.side_threads.keys().copied().collect();
-        for side_thread_id in side_thread_ids {
-            self.discard_side_thread(app_server, side_thread_id).await;
-        }
+        self.shutdown_side_threads(app_server).await;
         if let Some(thread_id) = self.chat_widget.thread_id() {
             if let Err(err) = app_server.thread_unsubscribe(thread_id).await {
                 tracing::warn!("failed to unsubscribe thread {thread_id}: {err}");
             }
             self.abort_thread_event_listener(thread_id);
+        }
+    }
+
+    pub(super) async fn shutdown_side_threads(&mut self, app_server: &mut AppServerSession) {
+        let side_thread_ids: Vec<ThreadId> = self.side_threads.keys().copied().collect();
+        for side_thread_id in side_thread_ids {
+            self.discard_side_thread(app_server, side_thread_id).await;
         }
     }
 
@@ -175,7 +179,12 @@ impl App {
         &mut self,
         target_session: &crate::resume_picker::SessionTarget,
     ) -> bool {
-        if self.active_thread_id != Some(target_session.thread_id) {
+        if self.active_thread_id != Some(target_session.thread_id)
+            || self
+                .thread_event_channels
+                .get(&target_session.thread_id)
+                .is_some_and(|channel| channel.attachment() != ThreadEventAttachment::Live)
+        {
             return false;
         };
 
@@ -445,7 +454,7 @@ impl App {
     ) -> Result<()> {
         if self.thread_unavailable(thread_id) {
             self.chat_widget.add_error_message(
-                "This conversation is unavailable; no operation was sent.".into(),
+                "This conversation is read-only or unavailable; no operation was sent.".into(),
             );
             return Ok(());
         }
@@ -659,6 +668,7 @@ impl App {
                 Ok(true)
             }
             AppCommand::UserTurn {
+                client_user_message_id,
                 items,
                 cwd,
                 approval_policy,
@@ -678,7 +688,12 @@ impl App {
                     let mut retried_after_turn_mismatch = false;
                     loop {
                         match app_server
-                            .turn_steer(thread_id, steer_turn_id.clone(), items.to_vec())
+                            .turn_steer(
+                                thread_id,
+                                steer_turn_id.clone(),
+                                client_user_message_id.clone(),
+                                items.to_vec(),
+                            )
                             .await
                         {
                             Ok(_) => return Ok(true),
@@ -751,6 +766,7 @@ impl App {
                     let response = app_server
                         .turn_start(
                             thread_id,
+                            client_user_message_id.clone(),
                             items.to_vec(),
                             cwd.clone(),
                             *approval_policy,
@@ -1470,7 +1486,7 @@ impl App {
         snapshot.turns = turns;
         snapshot
             .events
-            .retain(ThreadEventStore::event_survives_session_refresh);
+            .retain_mut(ThreadEventStore::event_survives_session_refresh);
     }
 
     /// Opens the `/subagents` picker after refreshing cached labels for known threads.
@@ -1679,7 +1695,19 @@ impl App {
         let cwd = self.chat_widget.config_ref().cwd.clone();
         let errors = errors_for_cwd(&cwd, &response);
         let errors = self.skill_load_warnings.newly_active_errors(&errors);
-        emit_skill_load_warnings(&self.app_event_tx, &errors);
+        let warnings = skill_load_warning_messages(&errors);
+        if self.skill_load_warnings.startup_complete {
+            for warning in warnings {
+                self.chat_widget.add_warning_message(warning);
+            }
+        } else {
+            self.app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
+                // The per-file diagnostics already identify every affected skill.
+                history_cell::StartupWarningsCell::new(
+                    warnings.into_iter().skip(/*n*/ 1).collect(),
+                ),
+            )));
+        }
         self.chat_widget.handle_skills_list_response(response);
     }
 
@@ -1864,37 +1892,16 @@ impl App {
         let had_active_view = self.chat_widget.has_active_view();
         self.handle_thread_event_now_recovering_file_changes(event)
             .await;
-        if let Some(user_message) = automatic_title_user_message {
-            let expected_title = user_message
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ")
-                .chars()
-                .take(super::thread_title::THREAD_TITLE_MAX_CHARS)
-                .collect::<String>();
-
-            if !expected_title.is_empty()
-                && let Some(thread_id) = self.active_thread_id
-            {
-                match app_server
-                    .thread_set_name(thread_id, expected_title.clone())
-                    .await
-                {
-                    Ok(()) => {
-                        self.chat_widget
-                            .expect_automatic_thread_name(expected_title.clone());
-                        self.generate_thread_title(
-                            app_server,
-                            thread_id,
-                            ThreadTitleDestination::Automatic { expected_title },
-                            super::thread_title::thread_title_prompt(&user_message),
-                        );
-                    }
-                    Err(error) => {
-                        tracing::debug!(%error, "failed to set provisional thread title");
-                    }
-                }
-            }
+        if let Some(user_message) = automatic_title_user_message
+            && !user_message.trim().is_empty()
+            && let Some(thread_id) = self.active_thread_id
+        {
+            self.generate_thread_title(
+                app_server,
+                thread_id,
+                ThreadTitleDestination::Automatic,
+                super::thread_title::thread_title_prompt(&user_message),
+            );
         }
         if !had_active_view
             && self.chat_widget.has_active_view()

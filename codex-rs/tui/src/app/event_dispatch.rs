@@ -34,6 +34,7 @@ impl App {
             && !matches!(
                 &event,
                 AppEvent::InsertHistoryCell(_)
+                    | AppEvent::ManagedWorktreeCreated(_)
                     | AppEvent::AppendMessageHistoryEntry { .. }
                     | AppEvent::BeginInitialHistoryReplayBuffer
                     | AppEvent::BeginThreadSwitchHistoryReplayBuffer
@@ -50,6 +51,10 @@ impl App {
                     | AppEvent::SelectAgentThread(_)
                     | AppEvent::StartSide { .. }
                     | AppEvent::ForkCurrentSession { .. }
+                    | AppEvent::StartManagedWorktree {
+                        mode: crate::app_event::ManagedWorktreeMode::Fork,
+                        ..
+                    }
                     | AppEvent::ForkSessionForPromptEdit { .. }
                     | AppEvent::SetThreadGoalDraft { .. }
                     | AppEvent::SetThreadGoalStatus {
@@ -70,7 +75,11 @@ impl App {
             }
             AppEvent::CloseMisalignmentReview => self.chat_widget.show_misalignment_policy_precaution(),
             AppEvent::SkillsListLoaded { ref cwd, .. }
-            | AppEvent::PluginMentionsLoaded { ref cwd, .. }
+                if cwds_differ(cwd, self.config.cwd.as_path()) =>
+            {
+                self.skill_load_warnings.startup_complete = true;
+            }
+            AppEvent::PluginMentionsLoaded { ref cwd, .. }
                 if cwds_differ(cwd, self.config.cwd.as_path()) => {}
             AppEvent::NewSession { name } => {
                 self.start_fresh_session_with_summary_hint(
@@ -81,6 +90,37 @@ impl App {
                 if self.chat_widget.has_misalignment_policy_violation() {
                     self.chat_widget.show_misalignment_policy_precaution();
                 }
+            }
+            AppEvent::StartManagedWorktree { mode, name } => {
+                if self.pending_start_managed_worktree.is_some() {
+                    self.chat_widget
+                        .add_error_message("A worktree is already being created.".to_string());
+                } else {
+                    self.pending_start_managed_worktree = Some((mode, name));
+                }
+            }
+            AppEvent::ManagedWorktreeCreated(created) => {
+                self.pending_managed_worktree_created = Some(created);
+            }
+            AppEvent::BrowseManagedWorktrees => {
+                if let Some(request) = self.chat_widget.request_managed_worktrees() {
+                    crate::worktree_browser::fetch(
+                        request,
+                        self.config.codex_home.to_path_buf(),
+                        self.app_event_tx.clone(),
+                    );
+                }
+            }
+            AppEvent::ManagedWorktreesLoaded { request, result } => {
+                self.chat_widget.on_managed_worktrees_loaded(request, result);
+            }
+            AppEvent::ManagedWorktreeAction { request, action } => {
+                if let Some(event) = self.chat_widget.managed_worktree_action(&request, action) {
+                    self.app_event_tx.send(event);
+                }
+            }
+            AppEvent::ShowManagedWorktreeActions { request, entry } => {
+                self.chat_widget.show_managed_worktree_actions(request, entry);
             }
             AppEvent::ChangeWorkingDirectory {
                 thread_id,
@@ -201,8 +241,8 @@ impl App {
                     self.chat_widget.maybe_send_next_queued_input();
                 }
             }
-            AppEvent::CopySelection { text, label } => {
-                self.chat_widget.copy_selection(text, label);
+            AppEvent::CopySelection { text, label, format } => {
+                self.chat_widget.copy_selection(text, label, format);
             }
             AppEvent::ClearUi { name } => {
                 self.clear_terminal_ui(tui, /*redraw_header*/ false)?;
@@ -238,61 +278,7 @@ impl App {
                 .await;
             }
             AppEvent::OpenResumePicker => {
-                let picker_app_server = match crate::start_app_server_for_picker(
-                    &self.config,
-                    &self.app_server_target,
-                    self.state_db.clone(),
-                    self.environment_manager.clone(),
-                )
-                .await
-                {
-                    Ok(app_server) => app_server,
-                    Err(err) => {
-                        self.chat_widget.add_error_message(format!(
-                            "Failed to start TUI session picker: {err}"
-                        ));
-                        self.chat_widget.maybe_send_next_queued_input();
-                        return Ok(AppRunControl::Continue);
-                    }
-                };
-                match crate::resume_picker::run_resume_picker_from_existing_session_with_app_server(
-                    tui,
-                    &self.config,
-                    &self.local_settings,
-                    /*show_all*/ false,
-                    /*include_non_interactive*/ false,
-                    picker_app_server,
-                    app_server.request_handle(),
-                    self.primary_thread_id
-                        .or(self.current_displayed_thread_id()),
-                )
-                .await?
-                {
-                    SessionSelection::Resume(target_session) => {
-                        match self
-                            .resume_target_session(tui, app_server, target_session)
-                            .await?
-                        {
-                            AppRunControl::Continue => {}
-                            AppRunControl::Exit(reason) => {
-                                return Ok(AppRunControl::Exit(reason));
-                            }
-                        }
-                    }
-                    SessionSelection::Exit
-                    | SessionSelection::StartFresh
-                    | SessionSelection::AgentsOverview => {
-                        self.refresh_in_memory_config_from_disk_best_effort(
-                            "closing the session picker",
-                        )
-                        .await;
-                    }
-                    SessionSelection::Fork(_) => {}
-                }
-
-                self.chat_widget.maybe_send_next_queued_input();
-                // Leaving alt-screen may blank the inline viewport; force a redraw either way.
-                tui.frame_requester().schedule_frame();
+                return Box::pin(self.open_resume_picker(tui, app_server)).await;
             }
             AppEvent::OpenExternalAgentConfigMigration => {
                 match crate::external_agent_config_migration::flow::handle_external_agent_config_migration_prompt(
@@ -328,18 +314,26 @@ impl App {
                     &self.config,
                     &id_or_name,
                 )
-                .await?
+                .await
                 {
-                    Some(target_session) => {
+                    Ok(Some(target_session)) => {
                         return self
                             .resume_target_session(tui, app_server, target_session)
                             .await;
                     }
-                    None => {
+                    Ok(None) => {
                         self.chat_widget.add_error_message(format!(
                             "No saved chat found matching '{id_or_name}'."
                         ));
                     }
+                    Err(err)
+                        if err
+                            .downcast_ref::<crate::named_session_lookup::AmbiguousSessionName>()
+                            .is_some() =>
+                    {
+                        self.chat_widget.add_error_message(err.to_string());
+                    }
+                    Err(err) => return Err(err),
                 }
             }
             AppEvent::ArchiveCurrentThread => {
@@ -533,6 +527,7 @@ impl App {
                         Ok(_) => {
                             app_server
                                 .start_thread_with_session_start_source(
+&self.local_settings,
                                     &config, /*session_start_source*/ None,
                                     /*remote_cwd_override*/ None,
                                 )
@@ -1201,6 +1196,7 @@ impl App {
                     result.map_err(|err| color_eyre::eyre::eyre!(err)),
                     "failed to load skills on startup",
                 );
+                self.skill_load_warnings.startup_complete = true;
             }
             AppEvent::StartFileSearch(query) => {
                 self.file_search.on_user_query(query.clone());
@@ -1624,6 +1620,20 @@ impl App {
                     }
                 }
             }
+            AppEvent::FetchPermissionProfiles { request_id, thread_cwd } => {
+                if self.chat_widget.permission_popup_request_is_current(request_id) {
+                    crate::permission_discovery::fetch(
+                        app_server,
+                        request_id,
+                        self.chat_widget.config_ref(),
+                        thread_cwd.as_deref(),
+                        self.app_event_tx.clone(),
+                    );
+                }
+            }
+            AppEvent::PermissionProfilesLoaded { request_id, result } => {
+                self.chat_widget.on_permission_profiles_loaded(request_id, result);
+            }
             AppEvent::FetchModels { request_id } => {
                 if self.chat_widget.model_popup_request_is_current(request_id) {
                     app_server.fetch_models(request_id, self.app_event_tx.clone());
@@ -1665,12 +1675,13 @@ impl App {
                     .await;
 
                 if let Some(default_effort) = default_effort.as_ref()
-                    && let Err(err) = crate::config_update::write_config_batch(
+                    && let Err(err) = self.persist_model_defaults(
                         app_server.request_handle(),
                         crate::config_update::build_model_selection_edits(
                             model.as_str(),
                             Some(default_effort),
                         ),
+                        "default model and reasoning effort",
                     )
                     .await
                 {
@@ -1728,7 +1739,7 @@ impl App {
                 category,
                 include_logs,
             } => {
-                self.chat_widget.open_feedback_note(category, include_logs);
+                self.chat_widget.open_feedback_note(category, include_logs, self.feedback_audience);
             }
             AppEvent::OpenFeedbackConsent { category } => {
                 self.chat_widget.open_feedback_consent(category);
@@ -2193,16 +2204,17 @@ impl App {
                 }
             }
             AppEvent::PersistModelSelection { model, effort } => {
-                match crate::config_update::write_config_batch(
+                match self.persist_model_defaults(
                     app_server.request_handle(),
                     crate::config_update::build_model_selection_edits(
                         model.as_str(),
                         effort.as_ref(),
                     ),
+                    "default model and reasoning effort",
                 )
                 .await
                 {
-                    Ok(_) => {
+                    Ok(()) => {
                         let effort_label = effort
                             .as_ref()
                             .map(std::string::ToString::to_string)
@@ -2295,10 +2307,10 @@ impl App {
                 let edits = crate::config_update::build_service_tier_selection_edits(
                     service_tier.as_deref(),
                 );
-                match crate::config_update::write_config_batch(app_server.request_handle(), edits)
+                match self.persist_model_defaults(app_server.request_handle(), edits, "default service tier")
                     .await
                 {
-                    Ok(_) => {
+                    Ok(()) => {
                         let message = if let Some(service_tier) = service_tier {
                             format!("Service tier set to {service_tier}")
                         } else {
@@ -2434,6 +2446,16 @@ impl App {
                         .add_error_message(format!("Failed to save approvals reviewer: {err}"));
                 }
             }
+            AppEvent::FetchExperimentalFeatures { thread_id, response_tx } => {
+                self.fetch_experimental_features(app_server, thread_id, response_tx);
+            }
+            AppEvent::SaveExperimentalFeatures { thread_id, updates, response_tx } => {
+                self.save_experimental_features(app_server, thread_id, updates, response_tx);
+            }
+            AppEvent::EnableFeatureForNewThreads(feature) => {
+                self.enable_feature_for_new_threads(tui, app_server, feature)
+                    .await;
+            }
             AppEvent::UpdateFeatureFlags { updates } => {
                 self.update_feature_flags(app_server, updates).await;
             }
@@ -2508,9 +2530,10 @@ impl App {
                 } else {
                     crate::config_update::clear_config_value(key_path)
                 };
-                if let Err(err) = crate::config_update::write_config_batch(
+                if let Err(err) = self.persist_model_defaults(
                     app_server.request_handle(),
                     vec![edit],
+                    "Plan mode reasoning effort",
                 )
                 .await
                 {
@@ -2540,9 +2563,6 @@ impl App {
                         "Failed to save model migration prompt preference: {err}"
                     ));
                 }
-            }
-            AppEvent::OpenApprovalsPopup => {
-                self.chat_widget.open_approvals_popup();
             }
             AppEvent::OpenAgentsOverview => {
                 self.open_agents_overview(app_server);
@@ -2611,16 +2631,20 @@ impl App {
                 self.temporary_structured_requests
                     .remove(&temporary_thread_id);
 
+                self.finish_thread_title_generation(thread_id, destination);
                 match destination {
-                    ThreadTitleDestination::Automatic { expected_title } => {
+                    ThreadTitleDestination::Automatic => {
                         if let Ok(response) = result
                             && let Some(title) = super::thread_title::parse_thread_title(&response)
-                            && self.chat_widget.thread_id() == Some(thread_id)
-                            && self.chat_widget.thread_name().as_deref()
-                                == Some(expected_title.as_str())
+                            && let Ok(thread) = app_server
+                                .thread_read(thread_id, /*include_turns*/ false)
+                                .await
+                            && thread.name.is_none()
                         {
                             match app_server.thread_set_name(thread_id, title.clone()).await {
-                                Ok(()) => self.chat_widget.expect_automatic_thread_name(title),
+                                Ok(()) => self
+                                    .chat_widget
+                                    .on_thread_name_updated(thread_id, Some(title)),
                                 Err(error) => {
                                     tracing::debug!(%error, "failed to apply generated thread title");
                                 }
@@ -2779,8 +2803,12 @@ impl App {
                     self.chat_widget.add_error_message(err);
                 }
             }
-            AppEvent::OpenPermissionsPopup => {
-                self.chat_widget.open_permissions_popup();
+            AppEvent::OpenPermissionsPopup | AppEvent::OpenApprovalsPopup => {
+                if app_server.uses_remote_workspace() {
+                    self.chat_widget.request_permission_profiles();
+                } else {
+                    self.chat_widget.open_approvals_popup();
+                }
             }
             AppEvent::OpenReviewBranchPicker(cwd) => {
                 self.chat_widget.show_review_branch_picker(&cwd).await;
@@ -3005,9 +3033,11 @@ impl App {
             } => {
                 self.apply_keymap_capture(context, action, key, intent)
                     .await;
+                self.merge_startup_warnings(tui, &history_cell::StartupWarningsCell::default());
             }
             AppEvent::KeymapCleared { context, action } => {
                 self.apply_keymap_clear(context, action).await;
+                self.merge_startup_warnings(tui, &history_cell::StartupWarningsCell::default());
             }
             AppEvent::GenerateRecap { thread_id } => {
                 if self.current_displayed_thread_id() == Some(thread_id) {

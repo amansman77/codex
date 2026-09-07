@@ -348,6 +348,7 @@ impl MessageProcessor {
                     config.codex_home.clone(),
                 )),
                 Some(analytics_events_client.clone()),
+                codex_core::passthrough_image_store(),
                 Arc::clone(&thread_store),
                 codex_core::local_agent_graph_store_from_state_db(state_db.as_ref()),
                 installation_id,
@@ -978,6 +979,12 @@ impl MessageProcessor {
         let result: Result<Option<ClientResponsePayload>, JSONRPCErrorError> = match codex_request {
             ClientRequest::Initialize { .. } => {
                 panic!("Initialize should be handled before initialized request dispatch");
+            }
+            ClientRequest::UserVerificationStatus { .. }
+            | ClientRequest::UserVerificationEnroll { .. }
+            | ClientRequest::UserVerificationDelete { .. }
+            | ClientRequest::UserVerificationVerify { .. } => {
+                Err(crate::user_verification::unavailable())
             }
             ClientRequest::ServerDiagnostics { .. } => Ok(Some(read_server_diagnostics().into())),
             ClientRequest::ConfigRead { params, .. } => self

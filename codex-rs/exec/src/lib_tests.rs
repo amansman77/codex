@@ -362,6 +362,7 @@ fn turn_items_for_thread_returns_matching_turn_items() {
         section: None,
         section_entered_at: None,
         project_id: None,
+        daybreak_enabled: None,
         history_mode: Default::default(),
         model_provider: "openai".to_string(),
         model: None,
@@ -373,6 +374,7 @@ fn turn_items_for_thread_returns_matching_turn_items() {
         path: None,
         cwd: test_path_buf("/tmp/project").abs(),
         cli_version: "0.0.0-test".to_string(),
+        originator: None,
         source: codex_app_server_protocol::SessionSource::Exec,
         can_accept_direct_input: None,
         thread_source: None,
@@ -842,6 +844,7 @@ async fn session_configured_from_thread_response_preserves_parent_thread_id() {
 fn sample_thread_start_response() -> ThreadStartResponse {
     ThreadStartResponse {
         thread: codex_app_server_protocol::Thread {
+            originator: None,
             environments: None,
             id: "67e55044-10b1-426f-9247-bb680e5fe0c8".to_string(),
             extra: None,
@@ -853,6 +856,7 @@ fn sample_thread_start_response() -> ThreadStartResponse {
             section: None,
             section_entered_at: None,
             project_id: None,
+            daybreak_enabled: None,
             history_mode: Default::default(),
             model_provider: "openai".to_string(),
             model: None,

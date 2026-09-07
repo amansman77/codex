@@ -2297,6 +2297,7 @@ mod tests {
             })),
         ];
         let stored_thread = StoredThread {
+            originator: None,
             thread_id,
             extra_config: None,
             rollout_path: None,
@@ -2315,6 +2316,7 @@ mod tests {
             section_position: None,
             section_entered_at: None,
             project_id: None,
+            daybreak_enabled: None,
             cwd: test_path_buf("/tmp").abs().into(),
             cli_version: "0.0.0".to_string(),
             source: SessionSource::Cli,
@@ -2474,7 +2476,7 @@ mod tests {
         let action = codex_protocol::protocol::GuardianAssessmentAction::Command {
             source: codex_protocol::protocol::GuardianCommandSource::Shell,
             command: "rm -rf /tmp/example.sqlite".to_string(),
-            cwd: test_path_buf("/tmp").abs(),
+            cwd: test_path_buf("/tmp").abs().into(),
         };
         let notification = guardian_auto_approval_review_notification(
             &conversation_id,
@@ -2522,7 +2524,7 @@ mod tests {
         let action = codex_protocol::protocol::GuardianAssessmentAction::Command {
             source: codex_protocol::protocol::GuardianCommandSource::Shell,
             command: "rm -rf /tmp/example.sqlite".to_string(),
-            cwd: test_path_buf("/tmp").abs(),
+            cwd: test_path_buf("/tmp").abs().into(),
         };
         let notification = guardian_auto_approval_review_notification(
             &conversation_id,

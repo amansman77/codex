@@ -7,6 +7,7 @@ mod fs;
 mod history;
 mod models;
 mod rollout_history;
+mod thread_list;
 
 #[cfg(test)]
 #[path = "app_server_session/collaboration_catalog_tests.rs"]
@@ -306,7 +307,6 @@ pub(crate) struct AppServerSession {
     task_search_generation: Arc<AtomicU64>,
     remote_cwd_override: Option<PathBuf>,
     thread_params_mode: ThreadParamsMode,
-    background_rollout_migration_enabled: bool,
     history_support: ThreadHistorySupport,
     thread_settings_update_supported: bool,
     default_model: Option<String>,
@@ -348,6 +348,11 @@ pub(crate) struct AppServerStartedThread {
     pub(crate) turns: Vec<Turn>,
     pub(crate) blocks_direct_input: bool,
     pub(crate) task_tools_available: bool,
+}
+
+pub(crate) fn is_active_writer_error(err: &color_eyre::eyre::Report) -> bool {
+    err.chain()
+        .any(|cause| cause.to_string().contains("already has an active writer"))
 }
 
 pub(crate) fn source_agent_path(source: &SessionSource) -> Option<String> {
@@ -403,7 +408,6 @@ impl AppServerSession {
             task_search_generation: Arc::new(AtomicU64::new(0)),
             remote_cwd_override: None,
             thread_params_mode,
-            background_rollout_migration_enabled: true,
             history_support: ThreadHistorySupport::Paginated,
             thread_settings_update_supported: true,
             default_model: None,
@@ -769,13 +773,17 @@ impl AppServerSession {
     #[cfg(test)]
     pub(crate) async fn start_thread(&mut self, config: &Config) -> Result<AppServerStartedThread> {
         self.start_thread_with_session_start_source(
-            config, /*session_start_source*/ None, /*remote_cwd_override*/ None,
+            &LocalSettings::from(config),
+            config,
+            /*session_start_source*/ None,
+            /*remote_cwd_override*/ None,
         )
         .await
     }
 
     pub(crate) async fn start_thread_with_session_start_source(
         &mut self,
+        local_settings: &LocalSettings,
         config: &Config,
         session_start_source: Option<ThreadStartSource>,
         remote_cwd_override: Option<&std::path::Path>,
@@ -802,8 +810,13 @@ impl AppServerSession {
         if history_support == ThreadHistorySupport::LegacyOnly {
             self.history_support = ThreadHistorySupport::LegacyOnly;
         }
-        let mut started =
-            started_thread_from_start_response(response, config, self.thread_params_mode()).await?;
+        let mut started = started_thread_from_start_response(
+            response,
+            local_settings,
+            config,
+            self.thread_params_mode(),
+        )
+        .await?;
         started.task_tools_available = task_tools_available;
         if task_tools_available {
             self.remember_task_tool_thread(started.session.thread_id);
@@ -958,8 +971,13 @@ impl AppServerSession {
                 "preserving the created fork after bounded history hydration failed"
             );
         }
-        let mut started =
-            started_thread_from_fork_response(response, &config, self.thread_params_mode()).await?;
+        let mut started = started_thread_from_fork_response(
+            response,
+            local_settings,
+            &config,
+            self.thread_params_mode(),
+        )
+        .await?;
         started.session.fork_parent_title = fork_parent.and_then(|thread| thread.name);
         if self.task_tools_available(thread_id) {
             started.task_tools_available = true;
@@ -1023,17 +1041,6 @@ impl AppServerSession {
                 None
             }
         }
-    }
-
-    pub(crate) async fn thread_list(
-        &mut self,
-        params: ThreadListParams,
-    ) -> Result<ThreadListResponse> {
-        let request_id = self.next_request_id();
-        self.client
-            .request_typed(ClientRequest::ThreadList { request_id, params })
-            .await
-            .wrap_err("thread/list failed during TUI session lookup")
     }
 
     /// Lists thread ids that the app server currently holds in memory.
@@ -1158,6 +1165,7 @@ impl AppServerSession {
                 params: ThreadMetadataUpdateParams {
                     thread_id: thread_id.to_string(),
                     project_id: None,
+                    daybreak_enabled: None,
                     git_info: Some(ThreadMetadataGitInfoUpdateParams {
                         sha: None,
                         branch: Some(Some(branch)),
@@ -1229,6 +1237,7 @@ impl AppServerSession {
     pub(crate) async fn turn_start(
         &mut self,
         thread_id: ThreadId,
+        client_user_message_id: String,
         items: Vec<UserInput>,
         cwd: PathBuf,
         approval_policy: AskForApproval,
@@ -1252,7 +1261,7 @@ impl AppServerSession {
                 params: TurnStartParams {
                     thread_id: thread_id.to_string(),
                     turn_trigger: None,
-                    client_user_message_id: None,
+                    client_user_message_id: Some(client_user_message_id),
                     input: items,
                     tool_output: None,
                     responsesapi_client_metadata: None,
@@ -1310,6 +1319,7 @@ impl AppServerSession {
         &mut self,
         thread_id: ThreadId,
         turn_id: String,
+        client_user_message_id: String,
         items: Vec<UserInput>,
     ) -> std::result::Result<TurnSteerResponse, TypedRequestError> {
         let request_id = self.next_request_id();
@@ -1318,7 +1328,7 @@ impl AppServerSession {
                 request_id,
                 params: TurnSteerParams {
                     thread_id: thread_id.to_string(),
-                    client_user_message_id: None,
+                    client_user_message_id: Some(client_user_message_id),
                     input: items,
                     responsesapi_client_metadata: None,
                     additional_context: None,
@@ -1619,6 +1629,7 @@ impl AppServerSession {
 
 pub(crate) async fn start_thread_with_request_handle(
     request_handle: AppServerRequestHandle,
+    local_settings: &LocalSettings,
     config: Config,
     thread_params_mode: ThreadParamsMode,
     remote_cwd_override: Option<PathBuf>,
@@ -1639,7 +1650,8 @@ pub(crate) async fn start_thread_with_request_handle(
                 bootstrap_request_error("thread/start failed during TUI bootstrap", err)
             })?;
     let mut started =
-        started_thread_from_start_response(response, &config, thread_params_mode).await?;
+        started_thread_from_start_response(response, local_settings, &config, thread_params_mode)
+            .await?;
     started.task_tools_available = task_tools_available;
     Ok(started)
 }
@@ -1828,7 +1840,7 @@ fn sandbox_mode_from_permission_profile(
                     .network_sandbox_policy()
                     .is_enabled()
                     .then_some(codex_app_server_protocol::SandboxMode::DangerFullAccess)
-            } else if file_system_policy.can_write_path_with_cwd(cwd, cwd) {
+            } else if file_system_policy.can_write_local_path_with_cwd(cwd, cwd) {
                 Some(codex_app_server_protocol::SandboxMode::WorkspaceWrite)
             } else {
                 Some(codex_app_server_protocol::SandboxMode::ReadOnly)
@@ -2067,14 +2079,19 @@ fn thread_cwd_from_config(
 
 async fn started_thread_from_start_response(
     response: ThreadStartResponse,
+    local_settings: &LocalSettings,
     config: &Config,
     thread_params_mode: ThreadParamsMode,
 ) -> Result<AppServerStartedThread> {
     let blocks_direct_input = thread_blocks_direct_input(&response.thread);
-    let session =
-        thread_session_state_from_thread_start_response(&response, config, thread_params_mode)
-            .await
-            .map_err(color_eyre::eyre::Report::msg)?;
+    let session = thread_session_state_from_thread_start_response(
+        &response,
+        local_settings,
+        config,
+        thread_params_mode,
+    )
+    .await
+    .map_err(color_eyre::eyre::Report::msg)?;
     Ok(AppServerStartedThread {
         session,
         turns: response.thread.turns,
@@ -2085,14 +2102,19 @@ async fn started_thread_from_start_response(
 
 async fn started_thread_from_resume_response(
     response: ThreadResumeResponse,
+    local_settings: &LocalSettings,
     config: &Config,
     thread_params_mode: ThreadParamsMode,
 ) -> Result<AppServerStartedThread> {
     let blocks_direct_input = thread_blocks_direct_input(&response.thread);
-    let session =
-        thread_session_state_from_thread_resume_response(&response, config, thread_params_mode)
-            .await
-            .map_err(color_eyre::eyre::Report::msg)?;
+    let session = thread_session_state_from_thread_resume_response(
+        &response,
+        local_settings,
+        config,
+        thread_params_mode,
+    )
+    .await
+    .map_err(color_eyre::eyre::Report::msg)?;
     Ok(AppServerStartedThread {
         session,
         turns: response.thread.turns,
@@ -2103,14 +2125,19 @@ async fn started_thread_from_resume_response(
 
 async fn started_thread_from_fork_response(
     response: ThreadForkResponse,
+    local_settings: &LocalSettings,
     config: &Config,
     thread_params_mode: ThreadParamsMode,
 ) -> Result<AppServerStartedThread> {
     let blocks_direct_input = thread_blocks_direct_input(&response.thread);
-    let session =
-        thread_session_state_from_thread_fork_response(&response, config, thread_params_mode)
-            .await
-            .map_err(color_eyre::eyre::Report::msg)?;
+    let session = thread_session_state_from_thread_fork_response(
+        &response,
+        local_settings,
+        config,
+        thread_params_mode,
+    )
+    .await
+    .map_err(color_eyre::eyre::Report::msg)?;
     Ok(AppServerStartedThread {
         session,
         turns: response.thread.turns,
@@ -2121,6 +2148,7 @@ async fn started_thread_from_fork_response(
 
 async fn thread_session_state_from_thread_start_response(
     response: &ThreadStartResponse,
+    local_settings: &LocalSettings,
     config: &Config,
     thread_params_mode: ThreadParamsMode,
 ) -> Result<ThreadSessionState, String> {
@@ -2146,13 +2174,15 @@ async fn thread_session_state_from_thread_start_response(
         response.runtime_workspace_roots.clone(),
         response.instruction_source_path_uris(),
         response.reasoning_effort.clone(),
-        config,
+        config.personality,
+        local_settings,
     )
     .await
 }
 
 async fn thread_session_state_from_thread_resume_response(
     response: &ThreadResumeResponse,
+    local_settings: &LocalSettings,
     config: &Config,
     thread_params_mode: ThreadParamsMode,
 ) -> Result<ThreadSessionState, String> {
@@ -2187,13 +2217,15 @@ async fn thread_session_state_from_thread_resume_response(
         response.runtime_workspace_roots.clone(),
         response.instruction_source_path_uris(),
         response.reasoning_effort.clone(),
-        config,
+        config.personality,
+        local_settings,
     )
     .await
 }
 
 async fn thread_session_state_from_thread_fork_response(
     response: &ThreadForkResponse,
+    local_settings: &LocalSettings,
     config: &Config,
     thread_params_mode: ThreadParamsMode,
 ) -> Result<ThreadSessionState, String> {
@@ -2219,7 +2251,8 @@ async fn thread_session_state_from_thread_fork_response(
         response.runtime_workspace_roots.clone(),
         response.instruction_source_path_uris(),
         response.reasoning_effort.clone(),
-        config,
+        config.personality,
+        local_settings,
     )
     .await
 }
@@ -2269,7 +2302,8 @@ async fn thread_session_state_from_thread_response(
     runtime_workspace_roots: Vec<AbsolutePathBuf>,
     instruction_source_paths: Vec<PathUri>,
     reasoning_effort: Option<codex_protocol::openai_models::ReasoningEffort>,
-    config: &Config,
+    personality: Option<codex_protocol::config_types::Personality>,
+    local_settings: &LocalSettings,
 ) -> Result<ThreadSessionState, String> {
     let thread_id = ThreadId::from_string(thread_id)
         .map_err(|err| format!("thread id `{thread_id}` is invalid: {err}"))?;
@@ -2278,9 +2312,8 @@ async fn thread_session_state_from_thread_response(
         .map(ThreadId::from_string)
         .transpose()
         .map_err(|err| format!("forked_from_id is invalid: {err}"))?;
-    let local_settings = LocalSettings::from(config);
     let history_config = codex_message_history::HistoryConfig::new(
-        local_settings.codex_home,
+        local_settings.codex_home.clone(),
         &local_settings.history,
     );
     let (log_id, entry_count) = codex_message_history::history_metadata(&history_config).await;
@@ -2301,7 +2334,7 @@ async fn thread_session_state_from_thread_response(
         instruction_source_paths,
         reasoning_effort,
         collaboration_mode: None,
-        personality: config.personality,
+        personality,
         message_history: Some(MessageHistoryMetadata {
             log_id,
             entry_count,
@@ -2330,6 +2363,10 @@ pub(crate) fn app_server_rate_limit_snapshots(
     }
     snapshots
 }
+
+#[cfg(test)]
+#[path = "app_server_session/prompt_history_tests.rs"]
+mod prompt_history_tests;
 
 #[cfg(test)]
 mod tests {
@@ -3693,6 +3730,7 @@ mod tests {
         let read_only_profile = PermissionProfile::read_only();
         let response = ThreadResumeResponse {
             thread: codex_app_server_protocol::Thread {
+                originator: None,
                 environments: None,
                 id: thread_id.to_string(),
                 extra: None,
@@ -3704,6 +3742,7 @@ mod tests {
                 section: None,
                 section_entered_at: None,
                 project_id: None,
+                daybreak_enabled: None,
                 history_mode: Default::default(),
                 model_provider: "openai".to_string(),
                 model: None,
@@ -3777,6 +3816,7 @@ mod tests {
 
         let started = started_thread_from_resume_response(
             response.clone(),
+            &LocalSettings::from(&config),
             &config,
             ThreadParamsMode::Remote,
         )
@@ -3807,6 +3847,7 @@ mod tests {
             .expect("config should build");
         let started = started_thread_from_resume_response(
             response.clone(),
+            &LocalSettings::from(&embedded_config),
             &embedded_config,
             ThreadParamsMode::Embedded,
         )
@@ -3818,6 +3859,7 @@ mod tests {
         empty_roots_response.runtime_workspace_roots = Vec::new();
         let started = started_thread_from_resume_response(
             empty_roots_response,
+            &LocalSettings::from(&config),
             &config,
             ThreadParamsMode::Remote,
         )
@@ -3904,7 +3946,8 @@ mod tests {
             Vec::new(),
             Vec::new(),
             /*reasoning_effort*/ None,
-            &config,
+            config.personality,
+            &LocalSettings::from(&config),
         )
         .await
         .expect("session should map");
@@ -3939,7 +3982,8 @@ mod tests {
             Vec::new(),
             Vec::new(),
             /*reasoning_effort*/ None,
-            &config,
+            config.personality,
+            &LocalSettings::from(&config),
         )
         .await
         .expect("session should map");
