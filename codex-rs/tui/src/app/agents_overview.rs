@@ -303,7 +303,6 @@ impl App {
         {
             return Ok(AppRunControl::Continue);
         }
-
         if self.primary_thread_id != Some(root_thread_id) {
             let previous_displayed_thread_id = self.current_displayed_thread_id();
             let mut previous_thread_ids =
@@ -370,6 +369,7 @@ impl App {
                 let target_session = SessionTarget {
                     path: target_thread.path.clone(),
                     thread_id: root_thread_id,
+                    cwd: Some(target_thread.cwd.to_path_buf()),
                     history_mode: Some(target_thread.history_mode),
                 };
                 match self
@@ -398,6 +398,9 @@ impl App {
                     }
                 }
             };
+            if unloaded && self.reject_remote_resume_permission_override(&resume_config) {
+                return Ok(AppRunControl::Continue);
+            }
             let baseline_approval = resume_config.permissions.approval_policy.value();
             let baseline_permissions =
                 RuntimePermissionProfileOverride::from_config(&resume_config);
@@ -491,6 +494,7 @@ impl App {
                             == RuntimePermissionProfileTurnOverride::LegacySandbox
                 });
             self.local_settings = local_settings;
+            self.refresh_server_version_overview_notice(CODEX_CLI_VERSION);
             self.config = resume_config;
             tui.set_notification_settings(
                 self.local_settings.tui.notification_settings.method,
@@ -722,6 +726,7 @@ impl App {
                 &config,
                 /*session_start_source*/ None,
                 remote_cwd.as_deref(),
+                /*selected_profile*/ None,
             )
             .await
         {
