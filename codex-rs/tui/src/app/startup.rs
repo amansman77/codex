@@ -3,6 +3,7 @@
 //! Owns the main app run loop from app-server bootstrap through terminal shutdown. Startup input
 //! remains isolated from protected interactive requests until the initialized composer owns it.
 
+use super::agents_overview_view::AgentsOverviewFocus;
 use super::reconnect::ReconnectState;
 use super::*;
 use crate::session_start::SessionStartAction;
@@ -53,7 +54,11 @@ pub(super) async fn prepare_fresh_startup_config(
             app_server.remote_cwd_override().unwrap_or(Path::new("."))
         }
     };
-    let defaults = super::new_session::read_new_session_defaults(app_server, defaults_cwd).await?;
+    let defaults = crate::config_update::read_effective_config_if_supported(
+        app_server.request_handle(),
+        defaults_cwd,
+    )
+    .await?;
     if let Some(defaults) = defaults.as_ref() {
         super::new_session::overlay_new_session_defaults(
             config,
@@ -781,7 +786,7 @@ See the Codex keymap documentation for supported actions and examples."
             );
         }
         if start_in_agents_overview {
-            app.open_agents_overview(&app_server);
+            app.open_agents_overview(&app_server, AgentsOverviewFocus::Composer);
         } else if !matches!(app.app_server_target, AppServerTarget::Embedded) {
             app.refresh_agents_overview_threads(&app_server);
         }

@@ -1,9 +1,12 @@
 mod capabilities;
 mod contributors;
 mod registry;
+mod session_isolation;
 mod state;
 mod turn_admission;
 mod user_instructions;
+
+pub use session_isolation::SessionIsolation;
 
 pub use capabilities::AgentSpawnFuture;
 pub use capabilities::AgentSpawner;
@@ -18,6 +21,7 @@ pub use capabilities::NoopResponseItemInjector;
 pub use capabilities::ResponseItemInjectionFuture;
 pub use capabilities::ResponseItemInjector;
 pub use codex_context_fragments::ContextualUserFragment;
+pub use codex_mcp::McpProtocolMode;
 pub use codex_mcp::ToolInfo as McpToolInfo;
 pub use codex_protocol::models::ContentItemKind;
 pub use codex_protocol::models::ResponseItem;

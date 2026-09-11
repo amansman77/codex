@@ -155,6 +155,7 @@ mod ide_context;
 mod inline_visualization;
 pub(crate) mod insert_history;
 pub use insert_history::insert_history_lines;
+mod footer_hint;
 mod key_hint;
 mod keymap;
 mod keymap_setup;
@@ -203,6 +204,7 @@ mod status;
 mod status_indicator_widget;
 mod streaming;
 mod style;
+mod system_motion;
 mod task_mentions;
 mod temporary_structured_request;
 mod terminal_hyperlinks;
@@ -1010,6 +1012,7 @@ pub async fn run_main(
     loader_overrides: LoaderOverrides,
     explicit_remote_endpoint: Option<RemoteAppServerEndpoint>,
 ) -> std::io::Result<AppExitInfo> {
+    system_motion::initialize().await;
     match startup_orchestration::run_main_inner(
         cli,
         arg0_paths,

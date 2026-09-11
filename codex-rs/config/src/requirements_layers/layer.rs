@@ -1,3 +1,4 @@
+use crate::ConfigPathContext;
 use crate::ConfigRequirementsToml;
 use crate::ManagedHooksRequirementsToml;
 use crate::RequirementSource;
@@ -21,6 +22,7 @@ pub struct RequirementsLayerEntry {
     pub(super) source: RequirementSource,
     toml: RequirementsLayerToml,
     base_dir: Option<AbsolutePathBuf>,
+    path_context: Option<ConfigPathContext>,
 }
 
 impl RequirementsLayerEntry {
@@ -29,6 +31,7 @@ impl RequirementsLayerEntry {
             source,
             toml: RequirementsLayerToml::String(contents.into()),
             base_dir: None,
+            path_context: None,
         }
     }
 
@@ -37,11 +40,19 @@ impl RequirementsLayerEntry {
             source,
             toml: RequirementsLayerToml::Value(value),
             base_dir: None,
+            path_context: None,
         }
     }
 
     pub fn with_base_dir(mut self, base_dir: AbsolutePathBuf) -> Self {
         self.base_dir = Some(base_dir);
+        self
+    }
+
+    /// Supplies the owning environment's facts for filesystem denial paths.
+    /// Other path fields keep their existing native deserialization behavior.
+    pub fn with_path_context(mut self, context: ConfigPathContext) -> Self {
+        self.path_context = Some(context);
         self
     }
 
@@ -53,6 +64,7 @@ impl RequirementsLayerEntry {
             source,
             toml,
             base_dir,
+            path_context: _,
         } = self;
         let toml = parse_layer_toml(&toml, &source)?;
         Ok((source, toml, base_dir))
@@ -81,6 +93,7 @@ impl ComposableRequirementsLayer {
             source,
             toml,
             base_dir,
+            path_context,
         } = layer;
         let (mut regular_toml, mut requirements) = {
             let _guard = base_dir
@@ -95,8 +108,34 @@ impl ComposableRequirementsLayer {
                 }
             }
 
+            // Provider fragments can be incomplete until all requirements layers
+            // are merged. Resolve explicit paths while their source base is still
+            // available, without deserializing complete auth command objects.
+            if let Some(providers) = regular_toml
+                .get_mut("model_providers")
+                .and_then(TomlValue::as_table_mut)
+            {
+                for (id, provider) in providers.iter_mut() {
+                    if let Some(cwd) = provider
+                        .get_mut("auth")
+                        .and_then(|auth| auth.get_mut("cwd"))
+                    {
+                        let resolved: AbsolutePathBuf =
+                            cwd.clone().try_into().map_err(|err: toml::de::Error| {
+                                RequirementsCompositionError::Parse {
+                                    layer_source: source.clone(),
+                                    message: format!("model_providers.{id}.auth.cwd: {err}"),
+                                }
+                            })?;
+                        *cwd = toml_value_from_serializable(resolved)?;
+                    }
+                }
+            }
+            let mut layer_requirements_toml = regular_toml.clone();
+            remove_top_level_field(&mut layer_requirements_toml, "model_providers");
+            let _path_context = path_context.as_ref().map(ConfigPathContext::enter);
             let requirements = parse_layer_requirements(
-                &RequirementsLayerToml::Value(regular_toml.clone()),
+                &RequirementsLayerToml::Value(layer_requirements_toml),
                 &source,
             )?;
             (regular_toml, requirements)

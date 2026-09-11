@@ -11,6 +11,7 @@ use codex_config::ConfigLayerEntry;
 use codex_config::ConfigLayerSource;
 use codex_config::ConfigLoadError;
 use codex_config::ConfigLoadOptions;
+use codex_config::ConfigPathContext;
 use codex_config::ConfigRequirements;
 use codex_config::ConfigRequirementsToml;
 use codex_config::ConfigRequirementsWithSources;
@@ -41,6 +42,8 @@ use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path_uri::PathConvention;
+use codex_utils_path_uri::PathUri;
 use pretty_assertions::assert_eq;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -2511,7 +2514,14 @@ extends = ":workspace"
         .await?;
 
     assert_eq!(
-        permission_profile_catalog(&config.config_layer_stack)?,
+        permission_profile_catalog(
+            &config.config_layer_stack,
+            &ConfigPathContext::new(
+                PathConvention::native(),
+                Some(PathUri::from_abs_path(&cwd)),
+                /*user_home_dir*/ None,
+            ),
+        )?,
         vec![
             PermissionProfileCatalogEntry {
                 id: ":read-only".to_string(),
@@ -2884,6 +2894,32 @@ deny_read = ["secrets/**"]
         ])
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn load_config_rejects_nul_in_required_deny_read_glob() -> anyhow::Result<()> {
+    let tmp = tempdir()?;
+    let err = ConfigBuilder::default()
+        .codex_home(tmp.path().to_path_buf())
+        .fallback_cwd(Some(tmp.path().to_path_buf()))
+        .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
+        .cloud_config_bundle(
+            CloudConfigBundleFixture::loader_with_enterprise_requirement(
+                r#"
+[permissions.filesystem]
+deny_read = ["secrets/**\u0000"]
+"#,
+            ),
+        )
+        .build()
+        .await
+        .expect_err("an unsupported required denial must fail configuration loading");
+
+    assert!(
+        err.to_string().contains("unsupported configuration path"),
+        "{err}"
+    );
     Ok(())
 }
 

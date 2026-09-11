@@ -147,6 +147,9 @@ pub(super) enum HistoryCapabilities {
     ThreadStartFails,
     ConfigReadUnsupported(i64),
     ConfigReadFails,
+    ConfigReadUnknownVoice,
+    VoiceCatalogCustom,
+    VoiceCatalogUnavailable,
 }
 
 /// Returns and resets `(thread/loaded/list, thread/read)` request counts.
@@ -240,7 +243,7 @@ pub(super) async fn start_recording_realtime_speech_app_server(
     .await
 }
 
-async fn start_recording_app_server_with_realtime_speech(
+pub(super) async fn start_recording_app_server_with_realtime_speech(
     config: &Config,
     history_capabilities: HistoryCapabilities,
     mut blocked_thread_list: Option<(ThreadId, oneshot::Sender<()>, oneshot::Receiver<()>)>,
@@ -372,6 +375,17 @@ async fn start_recording_app_server_with_realtime_speech(
                                 message: "config temporarily unavailable".to_string(),
                             },
                         })
+                    } else if history_capabilities == HistoryCapabilities::VoiceCatalogUnavailable
+                        && request.method == "thread/realtime/listVoices"
+                    {
+                        JSONRPCMessage::Error(JSONRPCError {
+                            id: request_id,
+                            error: JSONRPCErrorError {
+                                code: -32601,
+                                data: None,
+                                message: "method not found".to_string(),
+                            },
+                        })
                     } else if history_capabilities == HistoryCapabilities::ThreadStartFails
                         && request.method == "thread/start"
                     {
@@ -484,7 +498,25 @@ async fn start_recording_app_server_with_realtime_speech(
                                 },
                             })
                         } else {
+                            let unknown_voice = history_capabilities
+                                == HistoryCapabilities::ConfigReadUnknownVoice
+                                && matches!(&request, ClientRequest::ConfigRead { .. });
+                            let custom_voice_catalog = history_capabilities
+                                == HistoryCapabilities::VoiceCatalogCustom
+                                && matches!(
+                                    &request,
+                                    ClientRequest::ThreadRealtimeListVoices { .. }
+                                );
                             let mut result = embedded.request(request).await?;
+                            if unknown_voice && let Ok(value) = &mut result {
+                                value["config"]["realtime"]["voice"] =
+                                    serde_json::json!("future_voice");
+                            }
+                            if custom_voice_catalog && let Ok(value) = &mut result {
+                                value["voices"]["v1"] =
+                                    serde_json::json!(["maple", "cove", "juniper"]);
+                                value["voices"]["defaultV1"] = serde_json::json!("maple");
+                            }
                             if background {
                                 let terminal = r#"{"data":[{"itemId":"x","processId":"x","command":"x","cwd":"/"}],"nextCursor":null}"#;
                                 result = Ok(serde_json::from_str(terminal)?);
@@ -1824,6 +1856,7 @@ async fn older_pagination_reconciles_review_prompts_across_page_boundaries() -> 
     ]);
     let events = std::iter::once(EventMsg::TurnStarted(TurnStartedEvent {
         turn_id: "cross-page-review-turn".to_string(),
+        root_turn_id: None,
         trace_id: None,
         started_at: None,
         model_context_window: None,
@@ -1986,6 +2019,7 @@ async fn transcript_home_loads_every_older_history_page() -> Result<()> {
         .collect::<Result<Vec<_>, _>>()?;
     let events = std::iter::once(EventMsg::TurnStarted(TurnStartedEvent {
         turn_id: "multi-page-turn".to_string(),
+        root_turn_id: None,
         trace_id: None,
         started_at: None,
         model_context_window: None,
@@ -2394,6 +2428,7 @@ async fn underfilled_scrollback_fetches_older_pages_without_opening_the_transcri
         .collect::<Result<Vec<_>, _>>()?;
     let events = std::iter::once(EventMsg::TurnStarted(TurnStartedEvent {
         turn_id: "scrollback-pagination-turn".to_string(),
+        root_turn_id: None,
         trace_id: None,
         started_at: None,
         model_context_window: None,
@@ -2746,7 +2781,10 @@ async fn agents_overview_seeds_loaded_threads_when_recent_listing_is_unavailable
             if attempt == 0 {
                 app.refresh_agents_overview_threads(&app_server);
             } else {
-                app.open_agents_overview(&app_server);
+                app.open_agents_overview(
+                    &app_server,
+                    crate::app::agents_overview_view::AgentsOverviewFocus::List,
+                );
             }
             let Some(AppEvent::AgentsOverviewThreadsLoaded { request_id, result }) =
                 tokio::time::timeout(Duration::from_secs(10), rx.recv()).await?

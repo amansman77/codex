@@ -67,13 +67,16 @@ impl ManagedReviewerThreads {
         config.permissions.approval_policy = Constrained::allow_only(AskForApproval::Never);
         config.model_provider.supports_websockets &=
             parent.services.model_client.responses_websocket_enabled();
+        let mut thread_extension_init = codex_extension_api::ExtensionDataInit::default();
+        thread_extension_init.insert(codex_extension_api::SessionIsolation::Isolated);
         let options = StartThreadOptions {
+            thread_extension_init,
             session_source: Some(SessionSource::Internal(InternalSessionSource::Guardian)),
             thread_source: Some(ThreadSource::GuardianReview),
             environments: Some(context.environments().to_selections()),
             inherited_environments: Some(context.environments().clone()),
             user_instructions: Some(LoadedUserInstructions {
-                instructions: parent.user_instructions().await,
+                instructions: parent.inherited_instructions().await.user,
                 warnings: Vec::new(),
             }),
             client_mcp_extensions: parent.services.client_mcp_extensions.clone(),
