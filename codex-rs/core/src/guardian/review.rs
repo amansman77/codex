@@ -1,5 +1,5 @@
-//! Supplies host review preparation, interruption and runtime configuration.
-//! Guardian's extension owns the synchronous review loop and pool.
+//! Supplies host review preparation and context-dependent configuration.
+//! Guardian's extension owns routing, execution, reporting and denial accounting.
 
 #[path = "review_request.rs"]
 mod request;
@@ -7,23 +7,18 @@ mod request;
 use crate::context::GuardianContextMode;
 use codex_analytics::GuardianApprovalRequestSource;
 use codex_analytics::GuardianReviewAnalyticsResult;
-use codex_login::AuthManager;
 use codex_core_plugins::PluginCommandAttribution;
-use codex_extension_api::ThreadIdleCause;
 use codex_features::Feature;
 use codex_guardian_reviewer::GuardianReviewError;
 use codex_guardian_reviewer::GuardianReviewOutcome;
 #[cfg(test)]
 use codex_guardian_reviewer::GuardianReviewSessionLimits;
-use codex_protocol::config_types::ApprovalsReviewer;
-use codex_protocol::protocol::AskForApproval;
+use codex_guardian_reviewer::ReviewModel;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InternalSessionSource;
 use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
-use codex_protocol::protocol::TurnAbortReason;
-use codex_protocol::protocol::WarningEvent;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
@@ -32,8 +27,6 @@ use tokio_util::sync::CancellationToken;
 use crate::context::GuardianNodeReplPolicy;
 use crate::context::GuardianReviewEvidence;
 use crate::session::session::Session;
-use crate::session::turn_context::TurnContext;
-use crate::turn_timing::now_unix_timestamp_ms;
 
 use super::ApprovalRequestReasons;
 #[cfg(test)]
@@ -103,31 +96,7 @@ pub(crate) fn new_guardian_review_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
-/// Whether this turn should route allowed approval prompts through the guardian
-/// reviewer instead of surfacing them to the user. ARC may still block actions
-/// earlier in the flow.
-pub(crate) fn routes_approval_to_guardian(turn: &TurnContext) -> bool {
-    routes_approval_to_guardian_with_reviewer(turn, turn.config.approvals_reviewer)
-}
-
-/// Whether an approval with its own reviewer selection should be routed through guardian.
-pub(crate) fn routes_approval_to_guardian_with_reviewer(
-    turn: &TurnContext,
-    approvals_reviewer: ApprovalsReviewer,
-) -> bool {
-    routes_approval_policy_to_guardian(turn.approval_policy(), approvals_reviewer)
-}
-
-/// Whether an exact approval policy and reviewer should route through Guardian.
-pub(crate) fn routes_approval_policy_to_guardian(
-    approval_policy: AskForApproval,
-    approvals_reviewer: ApprovalsReviewer,
-) -> bool {
-    matches!(
-        approval_policy,
-        AskForApproval::OnRequest | AskForApproval::Granular(_)
-    ) && approvals_reviewer == ApprovalsReviewer::AutoReview
-}
+pub(crate) use codex_guardian_reviewer::routes_approval_policy_to_guardian;
 
 pub(crate) fn is_basic_session_source(session_source: &SessionSource) -> bool {
     match session_source {
@@ -135,58 +104,6 @@ pub(crate) fn is_basic_session_source(session_source: &SessionSource) -> bool {
         SessionSource::Internal(InternalSessionSource::Guardian) => true,
         _ => false,
     }
-}
-
-pub(super) async fn record_guardian_non_denial(session: &Arc<Session>, turn_id: &str) {
-    codex_guardian_reviewer::ReviewDenials::for_thread(&session.services.thread_extension_data)
-        .record_non_denial(turn_id)
-        .await;
-}
-
-async fn record_guardian_denial(session: &Arc<Session>, turn: &Arc<TurnContext>, turn_id: &str) {
-    let Some(message) =
-        codex_guardian_reviewer::ReviewDenials::for_thread(&session.services.thread_extension_data)
-            .record_denial(turn_id, turn.model_info())
-            .await
-    else {
-        return;
-    };
-
-    if session.turn_context_for_sub_id(turn_id).await.is_none() {
-        return;
-    }
-
-    session
-        .send_event(
-            turn.as_ref(),
-            EventMsg::GuardianWarning(WarningEvent { message }),
-        )
-        .await;
-
-    let runtime_handle = session.services.runtime_handle.clone();
-    let session = Arc::clone(session);
-    let turn_id = turn_id.to_string();
-    let _abort_task = runtime_handle.spawn(async move {
-        let aborted = session
-            .abort_turn_if_active(&turn_id, TurnAbortReason::Interrupted)
-            .await;
-        if aborted {
-            // Guardian aborts bypass normal task completion, so emit its idle lifecycle here.
-            // User interrupts deliberately do not take this path.
-            session
-                .emit_thread_idle_lifecycle_if_idle(ThreadIdleCause::Interrupted)
-                .await;
-        }
-    });
-}
-
-#[cfg(test)]
-pub(crate) async fn record_guardian_denial_for_test(
-    session: &Arc<Session>,
-    turn: &Arc<TurnContext>,
-    turn_id: &str,
-) {
-    record_guardian_denial(session, turn, turn_id).await;
 }
 
 #[derive(Clone)]
@@ -204,12 +121,7 @@ pub(super) struct GuardianReviewSessionConfig {
     pub(super) spawn_config: crate::config::Config,
     pub(super) node_repl_policy: GuardianNodeReplPolicy,
     pub(super) compaction_model_hash: Option<String>,
-    model: String,
-    reasoning_effort: Option<codex_protocol::openai_models::ReasoningEffort>,
-    default_review_model_id: String,
-    catalog_contains_auto_review: bool,
-    model_overridden: bool,
-    model_override: Option<String>,
+    review_model: ReviewModel,
 }
 
 pub(super) async fn guardian_review_session_config(
@@ -222,82 +134,18 @@ pub(super) async fn guardian_review_session_config(
         Some(network_proxy) => Some(network_proxy.proxy().current_cfg().await?),
         None => None,
     };
-    let available_models = session
+    let (review_model, guardian_model_info) =
+        super::reviewer_config::resolve_review_model(session, context).await;
+    let reviewer_config = session
         .services
-        .models_manager
-        .list_models(
-            codex_models_manager::manager::RefreshStrategy::Offline,
-            turn.config.http_client_factory(),
-        )
-        .await;
-    let default_review_model_id = turn.provider.approval_review_preferred_model();
-    // `available_models` is filtered by auth mode/visibility, not by whether
-    // the *active provider* can actually serve a given model id. For custom
-    // providers (Azure OpenAI, self-hosted proxies, etc.) the default
-    // preferred review model (e.g. `codex-auto-review`) can still show up in
-    // that catalog even though it isn't a real deployment on that provider,
-    // which previously caused the guardian to send a literal
-    // `codex-auto-review` model id to a non-OpenAI-hosted backend and 404.
-    // Only trust the catalog match when the user explicitly configured an
-    // override, or when the provider actually routes through OpenAI-hosted
-    // infrastructure; otherwise strip the unservable default so
-    // `select_review_model` falls through to the active session model.
-    let model_override = context.model_info.auto_review_model_override.as_deref();
-    let provider_can_serve_preferred_review_model = model_override.is_some()
-        || turn.provider.info().uses_openai_actor_authorization()
-        || (turn.provider.info().requires_openai_auth
-            && turn
-                .auth_manager
-                .as_deref()
-                .is_some_and(AuthManager::current_auth_uses_codex_backend));
-    let guardian_catalog_contains_auto_review = available_models
-        .iter()
-        .any(|preset| preset.model == default_review_model_id);
-    let available_models_for_review = if provider_can_serve_preferred_review_model {
-        available_models.clone()
-    } else {
-        available_models
-            .iter()
-            .filter(|preset| preset.model != default_review_model_id)
-            .cloned()
-            .collect()
-    };
-    let codex_guardian_reviewer::ReviewModel {
-        model: guardian_model,
-        reasoning_effort: guardian_reasoning_effort,
-        default_review_model_id,
-        catalog_contains_auto_review: _,
-        model_overridden: guardian_review_model_overridden,
-        model_override: guardian_review_model_override,
-    } = codex_guardian_reviewer::select_review_model(
-        &context.model_info,
-        context.reasoning_effort.as_ref(),
-        default_review_model_id,
-        &available_models_for_review,
-    );
-
-    // Resolve a separate reviewer against the current catalog on every attempt.
-    // Parent fallback must retain the action's metadata even after a catalog refresh.
-    let guardian_model_info =
-        if !guardian_catalog_contains_auto_review && !guardian_review_model_overridden {
-            Arc::clone(&context.model_info)
-        } else {
-            Arc::new(
-                session
-                    .services
-                    .models_manager
-                    .get_model_info(
-                        guardian_model.as_str(),
-                        &turn.config.to_models_manager_config(),
-                    )
-                    .await,
-            )
-        };
+        .thread_extension_data
+        .get::<codex_guardian_reviewer::ReviewerConfig<crate::config::Config>>()
+        .ok_or_else(|| anyhow::anyhow!("Guardian reviewer configuration is not installed"))?;
     let mut spawn_config = build_guardian_review_session_config(
-        turn.config.as_ref(),
+        (reviewer_config.0)(turn.config.as_ref())?,
         live_network_config,
-        guardian_model.as_str(),
-        guardian_reasoning_effort.clone(),
+        review_model.model.as_str(),
+        review_model.reasoning_effort.clone(),
         context.reasoning_summary,
         context.personality,
         guardian_model_info.model_messages.as_ref(),
@@ -312,7 +160,7 @@ pub(super) async fn guardian_review_session_config(
                 )
             })?;
     }
-    if guardian_model != context.model_info.slug {
+    if review_model.model != context.model_info.slug {
         spawn_config.model_context_window = None;
         spawn_config.model_auto_compact_token_limit = None;
     }
@@ -322,12 +170,7 @@ pub(super) async fn guardian_review_session_config(
         node_repl_policy: GuardianNodeReplPolicy::from_model_messages(
             guardian_model_info.model_messages.as_ref(),
         ),
-        model: guardian_model,
-        reasoning_effort: guardian_reasoning_effort,
-        default_review_model_id,
-        catalog_contains_auto_review: guardian_catalog_contains_auto_review,
-        model_overridden: guardian_review_model_overridden,
-        model_override: guardian_review_model_override,
+        review_model,
     })
 }
 
@@ -354,6 +197,14 @@ async fn run_guardian_review_session_before_deadline(
     external_cancel: Option<CancellationToken>,
     deadline: Instant,
 ) -> (GuardianReviewOutcome, GuardianReviewAnalyticsResult) {
+    let Some(pool) = session.guardian_review_session() else {
+        return (
+            GuardianReviewOutcome::Error(GuardianReviewError::prompt_build(anyhow::anyhow!(
+                "Guardian extension is not installed for this thread"
+            ))),
+            GuardianReviewAnalyticsResult::without_session(),
+        );
+    };
     let session_config = match guardian_review_session_config(session.as_ref(), &context).await {
         Ok(session_config) => session_config,
         Err(err) => {
@@ -365,7 +216,7 @@ async fn run_guardian_review_session_before_deadline(
     };
     let (session_outcome, session_analytics_result) =
         Box::pin(super::review_session::run_guardian_review_session(
-            session.guardian_review_session(),
+            pool,
             GuardianReviewSessionParams {
                 parent_session: Arc::clone(&session),
                 parent_context: context.clone(),
@@ -375,13 +226,8 @@ async fn run_guardian_review_session_before_deadline(
                 request,
                 reasons,
                 schema,
-                model: session_config.model,
+                review_model: session_config.review_model,
                 compaction_model_hash: session_config.compaction_model_hash,
-                reasoning_effort: session_config.reasoning_effort,
-                guardian_default_review_model_id: session_config.default_review_model_id,
-                guardian_catalog_contains_auto_review: session_config.catalog_contains_auto_review,
-                guardian_review_model_overridden: session_config.model_overridden,
-                guardian_review_model_override: session_config.model_override,
                 reasoning_summary: context.reasoning_summary,
                 personality: context.personality,
                 external_cancel,

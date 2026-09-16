@@ -103,6 +103,7 @@ pub struct ThreadConfigSnapshot {
     pub parent_thread_id: Option<ThreadId>,
     pub thread_source: Option<ThreadSource>,
     pub originator: String,
+    pub disabled_plugin_ids: Vec<String>,
 }
 
 impl ThreadConfigSnapshot {
@@ -356,6 +357,23 @@ impl CodexThread {
         }
     }
 
+    /// Starts a new internal continuation turn when idle, including in Plan mode.
+    /// Rejects if a newer task has started, even if it has already finished.
+    /// The input must be a response item; it is never treated as user authorization.
+    pub async fn continue_turn_if_idle(
+        &self,
+        request: TurnInputRequest,
+        expected_previous_turn_id: String,
+    ) -> CodexResult<TurnInputSubmission> {
+        self.submit_turn_input_with_mode(
+            request,
+            TurnInputMode::ContinueIfIdle {
+                expected_previous_turn_id,
+            },
+        )
+        .await
+    }
+
     /// Resumes an interrupted regular turn only when the thread is idle.
     ///
     /// Recovery starts no new user input and preserves the turn ID that was
@@ -494,6 +512,13 @@ impl CodexThread {
         items: Vec<ResponseItem>,
     ) -> Result<(), Vec<ResponseItem>> {
         self.session.inject_if_running(items).await
+    }
+
+    /// Captures a regular turn only after its input is recorded. The caller must flush the rollout.
+    pub async fn interrupted_turn(
+        &self,
+    ) -> Option<(String, TurnStartOptions, TurnEnvironmentSelection)> {
+        self.session.interrupted_turn().await
     }
 
     /// Returns the trusted root when the expected turn is currently active.
@@ -691,7 +716,7 @@ impl CodexThread {
 
     pub async fn guardian_trunk_rollout_path(&self) -> Option<PathBuf> {
         self.session
-            .guardian_review_session()
+            .guardian_review_session()?
             .trunk()
             .await?
             .rollout_path()

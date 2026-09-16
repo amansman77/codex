@@ -2,6 +2,8 @@
 
 #[path = "tests/daybreak_tests.rs"]
 mod daybreak_tests;
+#[path = "tests/math_interruption_tests.rs"]
+mod math_interruption_tests;
 
 #[path = "tests/advanced_reasoning_tests.rs"]
 mod advanced_reasoning_tests;
@@ -69,6 +71,8 @@ mod transcript_composer;
 mod turn_submission;
 #[path = "tests/user_verification_routes_tests.rs"]
 mod user_verification_routes;
+#[path = "tests/worktree_background_terminals_tests.rs"]
+mod worktree_background_terminals_tests;
 
 use super::*;
 use crate::app_backtrack::BacktrackSelection;
@@ -398,6 +402,7 @@ async fn handle_mcp_inventory_result_respects_origin_thread() {
 
     app.handle_mcp_inventory_result(
         Ok(vec![McpServerStatus {
+            server_capabilities: None,
             tools_error: None,
             name: "docs".to_string(),
             runtime_status: None,
@@ -1784,6 +1789,8 @@ async fn replay_thread_snapshot_restores_collaboration_mode_without_input() {
             reasoning_effort: Some(Some(ReasoningEffortConfig::High)),
             developer_instructions: None,
         });
+    app.chat_widget
+        .set_plan_mode_reasoning_effort(Some(ReasoningEffortConfig::High));
     let input_state = app
         .chat_widget
         .capture_thread_input_state()
@@ -1791,6 +1798,8 @@ async fn replay_thread_snapshot_restores_collaboration_mode_without_input() {
 
     let (chat_widget, _app_event_tx, _rx, _new_op_rx) = make_chatwidget_manual_with_sender().await;
     app.chat_widget = chat_widget;
+    app.chat_widget
+        .set_plan_mode_reasoning_effort(Some(ReasoningEffortConfig::Low));
     app.chat_widget.handle_thread_session(session.clone());
     app.chat_widget
         .set_reasoning_effort(Some(ReasoningEffortConfig::Low));
@@ -1820,6 +1829,14 @@ async fn replay_thread_snapshot_restores_collaboration_mode_without_input() {
         ModeKind::Plan
     );
     assert_eq!(app.chat_widget.current_model(), "gpt-restored");
+    assert_eq!(
+        app.chat_widget.current_reasoning_effort(),
+        Some(ReasoningEffortConfig::High)
+    );
+    for _ in 0..2 {
+        app.chat_widget
+            .handle_key_event(KeyEvent::from(KeyCode::BackTab));
+    }
     assert_eq!(
         app.chat_widget.current_reasoning_effort(),
         Some(ReasoningEffortConfig::High)
@@ -3234,7 +3251,6 @@ default_permissions = "locked-down"
             approvals_reviewer: None,
             permission_profile: Some(app.config.permissions.permission_profile().clone()),
             active_permission_profile: app.config.permissions.active_permission_profile(),
-            windows_sandbox_level: None,
             model: None,
             effort: None,
             summary: None,
@@ -3328,7 +3344,6 @@ async fn update_feature_flags_enabling_guardian_selects_auto_review() -> Result<
             approvals_reviewer: Some(auto_review.approvals_reviewer),
             permission_profile: Some(auto_review.permission_profile()),
             active_permission_profile: Some(auto_review.active_permission_profile.clone()),
-            windows_sandbox_level: None,
             model: None,
             effort: None,
             summary: None,
@@ -3423,7 +3438,6 @@ async fn update_feature_flags_disabling_guardian_clears_review_policy_and_restor
             approvals_reviewer: Some(ApprovalsReviewer::User),
             permission_profile: None,
             active_permission_profile: None,
-            windows_sandbox_level: None,
             model: None,
             effort: None,
             summary: None,
@@ -3504,7 +3518,6 @@ async fn update_feature_flags_enabling_guardian_overrides_explicit_manual_review
             approvals_reviewer: Some(auto_review.approvals_reviewer),
             permission_profile: Some(auto_review.permission_profile()),
             active_permission_profile: Some(auto_review.active_permission_profile.clone()),
-            windows_sandbox_level: None,
             model: None,
             effort: None,
             summary: None,
@@ -3564,7 +3577,6 @@ async fn update_feature_flags_disabling_guardian_clears_manual_review_policy_wit
             approvals_reviewer: Some(ApprovalsReviewer::User),
             permission_profile: None,
             active_permission_profile: None,
-            windows_sandbox_level: None,
             model: None,
             effort: None,
             summary: None,
@@ -4398,6 +4410,7 @@ async fn inactive_thread_started_notification_initializes_replay_session() -> Re
     let primary_cwd = test_path_buf("/tmp/main").abs();
     let shared_root = test_path_buf("/tmp/shared").abs();
     let primary_session = ThreadSessionState {
+        windows_sandbox_host: WindowsSandboxHost::Local,
         approval_policy: AskForApproval::OnRequest,
         permission_profile: PermissionProfile::workspace_write(),
         runtime_workspace_roots: vec![primary_cwd.clone(), shared_root.clone()],
@@ -4422,7 +4435,11 @@ async fn inactive_thread_started_notification_initializes_replay_session() -> Re
         ServerNotification::ThreadStarted(ThreadStartedNotification {
             thread: Thread {
                 originator: None,
-                environments: None,
+                environments: Some(vec![codex_app_server_protocol::ThreadEnvironment {
+                    environment_id: "remote".to_string(),
+                    cwd: test_path_buf("/tmp/agent").abs().into(),
+                    runtime_workspace_roots: Vec::new(),
+                }]),
                 id: agent_thread_id.to_string(),
                 extra: None,
                 session_id: agent_thread_id.to_string(),
@@ -4469,6 +4486,7 @@ async fn inactive_thread_started_notification_initializes_replay_session() -> Re
     drop(store);
 
     assert_eq!(session.thread_id, agent_thread_id);
+    assert_eq!(session.windows_sandbox_host, WindowsSandboxHost::Remote);
     assert_eq!(session.thread_name, Some("agent thread".to_string()));
     assert_eq!(session.model, "gpt-agent");
     assert_eq!(session.model_provider_id, "agent-provider");
@@ -5078,6 +5096,7 @@ async fn side_thread_snapshot_hides_forked_parent_transcript() {
     let side_thread_id = ThreadId::new();
     let mut store = ThreadEventStore::new(/*capacity*/ 4);
     let session = ThreadSessionState {
+        windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
         forked_from_id: Some(parent_thread_id),
         fork_parent_title: None,
         ..test_thread_session(side_thread_id, test_path_buf("/tmp/side"))
@@ -5145,6 +5164,7 @@ async fn side_thread_snapshot_skips_session_header_preamble() {
     let snapshot = ThreadEventSnapshot {
         delegated_turns: Vec::new(),
         session: Some(ThreadSessionState {
+            windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
             forked_from_id: Some(parent_thread_id),
             fork_parent_title: None,
             ..test_thread_session(side_thread_id, test_path_buf("/tmp/side"))
@@ -5726,6 +5746,7 @@ async fn render_clear_ui_header_after_long_transcript_for_snapshot() -> String {
     };
     let make_header = |is_first| -> Arc<dyn HistoryCell> {
         let session = ThreadSessionState {
+            windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
             thread_id: ThreadId::new(),
             forked_from_id: None,
             fork_parent_title: None,
@@ -5883,6 +5904,7 @@ async fn make_test_app() -> App {
         last_thread_usage_status_cell: None,
         pending_thread_usage_history_refresh: false,
         overlay: None,
+        retained_analytics: None,
         deferred_history_lines: Vec::new(),
         has_emitted_history_lines: false,
         transcript_reflow: TranscriptReflowState::default(),
@@ -5911,7 +5933,7 @@ async fn make_test_app() -> App {
         pending_realtime_transcript_replay: HashMap::new(),
         realtime_replay_order: VecDeque::new(),
         temporary_structured_requests: HashMap::new(),
-        pending_thread_titles: HashSet::new(),
+        pending_thread_titles: HashMap::new(),
         thread_event_listener_tasks: HashMap::new(),
         agent_navigation: AgentNavigationState::default(),
         pending_server_profiles: HashMap::new(),
@@ -5982,6 +6004,7 @@ pub(super) async fn make_test_app_with_channels() -> (
             last_thread_usage_status_cell: None,
             pending_thread_usage_history_refresh: false,
             overlay: None,
+            retained_analytics: None,
             deferred_history_lines: Vec::new(),
             has_emitted_history_lines: false,
             transcript_reflow: TranscriptReflowState::default(),
@@ -6010,7 +6033,7 @@ pub(super) async fn make_test_app_with_channels() -> (
             pending_realtime_transcript_replay: HashMap::new(),
             realtime_replay_order: VecDeque::new(),
             temporary_structured_requests: HashMap::new(),
-            pending_thread_titles: HashSet::new(),
+            pending_thread_titles: HashMap::new(),
             thread_event_listener_tasks: HashMap::new(),
             agent_navigation: AgentNavigationState::default(),
             pending_server_profiles: HashMap::new(),
@@ -6270,6 +6293,7 @@ async fn replace_goal_confirmation_snapshot() {
 
 fn test_thread_session(thread_id: ThreadId, cwd: PathBuf) -> ThreadSessionState {
     ThreadSessionState {
+        windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
         thread_id,
         forked_from_id: None,
         fork_parent_title: None,
@@ -7307,6 +7331,7 @@ async fn backtrack_selection_preserves_selected_prompt_and_requests_branch() {
 
     let make_header = |is_first| {
         let session = ThreadSessionState {
+            windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
             thread_id: ThreadId::new(),
             forked_from_id: None,
             fork_parent_title: None,
@@ -7379,6 +7404,7 @@ async fn backtrack_selection_preserves_selected_prompt_and_requests_branch() {
     let base_id = ThreadId::new();
     app.chat_widget
         .handle_thread_session(crate::session_state::ThreadSessionState {
+            windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
             thread_id: base_id,
             forked_from_id: None,
             fork_parent_title: None,
@@ -7629,9 +7655,8 @@ async fn remote_resume_keeps_server_only_cwd_out_of_local_config() -> Result<()>
             auth_token: None,
         },
     };
-    let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(&app.config))
-        .await?
-        .with_remote_cwd_override(Some(remote_cwd.clone()));
+    app.harness_overrides.cwd = Some(remote_cwd.clone());
+    let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(&app.config)).await?;
     app_server
         .resume_thread(
             &crate::local_settings::LocalSettings::from(&app.config),
@@ -7666,7 +7691,7 @@ async fn remote_resume_keeps_server_only_cwd_out_of_local_config() -> Result<()>
         .await?;
 
     assert!(matches!(control, AppRunControl::Continue));
-    assert_eq!(app_server.remote_cwd_override(), Some(remote_cwd.as_path()));
+    assert_eq!(app.harness_overrides.cwd, Some(remote_cwd));
     assert!(!crate::session_resume::cwds_differ(
         app.config.cwd.as_path(),
         &local_cwd,
@@ -7715,6 +7740,20 @@ async fn in_app_resume_uses_configured_or_explicit_cwd() -> Result<()> {
             codex_home.join("config.toml"),
             format!("[tui]\nresume_cwd = \"{configured_mode}\"\n"),
         )?;
+        for cwd in [
+            &launch_cwd,
+            &active_cwd,
+            &session_cwd,
+            &explicit_cwd,
+            &runtime_cwd,
+        ] {
+            crate::legacy_core::config::set_project_trust_level(
+                &codex_home,
+                cwd,
+                codex_protocol::config_types::TrustLevel::Trusted,
+            )
+            .map_err(std::io::Error::other)?;
+        }
         let config = ConfigBuilder::default()
             .codex_home(codex_home.clone())
             .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
@@ -7843,6 +7882,12 @@ async fn remembered_current_cwd_stays_at_launch_across_in_app_resumes() -> Resul
     std::fs::create_dir_all(&active_cwd)?;
     std::fs::create_dir_all(&first_session_cwd)?;
     std::fs::create_dir_all(&second_session_cwd)?;
+    crate::legacy_core::config::set_project_trust_level(
+        &codex_home,
+        &launch_cwd,
+        codex_protocol::config_types::TrustLevel::Trusted,
+    )
+    .map_err(std::io::Error::other)?;
     let config = ConfigBuilder::default()
         .codex_home(codex_home.clone())
         .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
@@ -7914,12 +7959,12 @@ async fn remembered_current_cwd_stays_at_launch_across_in_app_resumes() -> Resul
     let state_db =
         crate::init_state_db_for_app_server_target(&config, &crate::AppServerTarget::Embedded)
             .await?;
-    let mut app_server = crate::start_app_server_for_picker(
+    let mut app_server = Box::pin(crate::start_app_server_for_picker(
         &config,
         &crate::AppServerTarget::Embedded,
         state_db.clone(),
         Arc::new(EnvironmentManager::default_for_tests()),
-    )
+    ))
     .await?;
     let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
     app.config = config;
@@ -7930,9 +7975,8 @@ async fn remembered_current_cwd_stays_at_launch_across_in_app_resumes() -> Resul
     let mut tui = crate::tui::test_support::make_test_tui()?;
 
     for target_session in targets {
-        let control = app
-            .resume_target_session(&mut tui, &mut app_server, target_session)
-            .await?;
+        let control =
+            Box::pin(app.resume_target_session(&mut tui, &mut app_server, target_session)).await?;
 
         assert!(matches!(control, AppRunControl::Continue));
         assert!(!crate::session_resume::cwds_differ(
@@ -8513,44 +8557,13 @@ async fn refreshed_snapshot_session_persists_resumed_turns() {
 }
 
 #[tokio::test]
-async fn late_usage_result_can_follow_finalized_plan() {
-    let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
-    app.chat_widget
-        .add_token_activity_output(crate::chatwidget::TokenActivityView::Daily);
-    let request_id = match app_event_rx.try_recv() {
-        Ok(AppEvent::RefreshTokenActivity { request_id }) => request_id,
-        other => panic!("expected token activity refresh request, got {other:?}"),
-    };
-
-    app.chat_widget.note_stream_consolidation_queued();
-    app.transcript_cells
-        .push(Arc::new(history_cell::new_proposed_plan_stream(
-            vec![Line::from("finalized plan")],
-            /*is_stream_continuation*/ false,
-        )));
-    app.chat_widget.note_stream_consolidation_completed();
-
-    assert!(
-        app.chat_widget.finish_token_activity_refresh(
-            request_id,
-            Err("token activity unavailable".to_string()),
-        )
-    );
-    assert!(!app.pending_usage_output_insertion_blocked());
-    assert!(
-        app.chat_widget
-            .take_completed_token_activity_output()
-            .is_some()
-    );
-}
-
-#[tokio::test]
 async fn new_session_requests_shutdown_for_previous_conversation() {
     Box::pin(async {
         let (mut app, mut app_event_rx, mut op_rx) = Box::pin(make_test_app_with_channels()).await;
 
         let thread_id = ThreadId::new();
         let event = crate::session_state::ThreadSessionState {
+            windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
             thread_id,
             forked_from_id: None,
             fork_parent_title: None,
@@ -8686,6 +8699,7 @@ async fn override_turn_context_sends_thread_settings_update() {
         let thread_id = started.session.thread_id;
         let initial_model = started.session.model.clone();
         let initial_effort = started.session.reasoning_effort.clone();
+        let initial_personality = started.session.personality;
         app.enqueue_primary_thread_session(started.session, started.turns)
             .await
             .expect("primary thread should be registered");
@@ -8706,7 +8720,6 @@ async fn override_turn_context_sends_thread_settings_update() {
             Some(ActivePermissionProfile::new(
                 codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE,
             )),
-            /*windows_sandbox_level*/ None,
             Some("gpt-5.4".to_string()),
             Some(Some(ReasoningEffortConfig::High)),
             /*summary*/ None,
@@ -8759,8 +8772,8 @@ async fn override_turn_context_sends_thread_settings_update() {
             collaboration_mode.settings.reasoning_effort
         );
         assert_eq!(
-            notification.thread_settings.personality,
-            Some(Personality::Pragmatic)
+            notification.thread_settings.personality, initial_personality,
+            "the Pragmatic turn override should not change personality"
         );
 
         app.handle_app_server_event(
@@ -8789,7 +8802,7 @@ async fn override_turn_context_sends_thread_settings_update() {
             updated_mode.settings.reasoning_effort,
             collaboration_mode.settings.reasoning_effort
         );
-        assert_eq!(updated_session.personality, Some(Personality::Pragmatic));
+        assert_eq!(updated_session.personality, initial_personality);
         assert_eq!(updated_session.service_tier, Some(service_tier));
         assert_eq!(updated_session.approval_policy, AskForApproval::OnRequest);
         assert_eq!(
@@ -8948,8 +8961,25 @@ async fn changing_cyber_model_reasoning_preserves_selected_permissions() {
             .expect("primary thread should be registered");
 
         let mut tui = crate::tui::test_support::make_test_tui().expect("test tui");
-        for effort in [ReasoningEffortConfig::High, ReasoningEffortConfig::Ultra] {
-            if effort == ReasoningEffortConfig::Ultra {
+        for (effort, session_only) in [
+            (ReasoningEffortConfig::High, false),
+            (ReasoningEffortConfig::Medium, true),
+            (ReasoningEffortConfig::Ultra, false),
+            (ReasoningEffortConfig::High, true),
+            (ReasoningEffortConfig::Ultra, true),
+        ] {
+            if session_only {
+                app.handle_event(
+                    &mut tui,
+                    &mut app_server,
+                    AppEvent::SelectSessionModel {
+                        model: model_name.clone(),
+                        effort: Some(effort.clone()),
+                    },
+                )
+                .await
+                .expect("session-only reasoning selection should succeed");
+            } else if effort == ReasoningEffortConfig::Ultra {
                 app.chat_widget
                     .set_feature_enabled(Feature::CollaborationModes, /*enabled*/ true);
                 app.chat_widget
@@ -9214,6 +9244,7 @@ async fn inactive_thread_settings_notification_updates_cached_collaboration_mode
     let notification = ThreadSettingsUpdatedNotification {
         thread_id: inactive_thread_id.to_string(),
         thread_settings: ThreadSettings {
+            disabled_plugin_ids: Vec::new(),
             cwd: test_absolute_path("/tmp/thread-settings"),
             approval_policy: AskForApproval::OnRequest,
             approvals_reviewer: codex_app_server_protocol::ApprovalsReviewer::AutoReview,
@@ -9283,6 +9314,7 @@ async fn clear_only_ui_reset_preserves_chat_session_state() {
     let thread_id = ThreadId::new();
     app.chat_widget
         .handle_thread_session(crate::session_state::ThreadSessionState {
+            windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
             thread_id,
             forked_from_id: None,
             fork_parent_title: None,
