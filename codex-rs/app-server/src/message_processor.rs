@@ -144,7 +144,7 @@ pub(crate) struct MessageProcessor {
     models_refresh_worker: ModelsRefreshWorker,
     turn_cost_worker: Option<TurnCostWorker>,
     skills_watcher: Arc<SkillsWatcher>,
-    account_processor: AccountRequestProcessor,
+    account_processor: Arc<AccountRequestProcessor>,
     apps_processor: AppsRequestProcessor,
     catalog_processor: CatalogRequestProcessor,
     command_exec_processor: CommandExecRequestProcessor,
@@ -520,7 +520,6 @@ impl MessageProcessor {
             Arc::clone(&thread_manager),
             outgoing.clone(),
             analytics_events_client.clone(),
-            arg0_paths.clone(),
             Arc::clone(&config),
             config_manager.clone(),
             pending_thread_unloads,
@@ -1020,15 +1019,15 @@ impl MessageProcessor {
                     return;
                 }
                 let processor_for_request = Arc::clone(&processor);
-                let result = processor_for_request
-                    .handle_initialized_client_request(
-                        connection_request_id,
-                        codex_request,
-                        request_context,
-                        session,
-                        event_stream_ready,
-                    )
-                    .await;
+                // Keep queued requests small to avoid large stack temporaries during construction.
+                let result = Box::pin(processor_for_request.handle_initialized_client_request(
+                    connection_request_id,
+                    codex_request,
+                    request_context,
+                    session,
+                    event_stream_ready,
+                ))
+                .await;
                 if let Err(error) = result {
                     processor.outgoing.send_error(error_request_id, error).await;
                 }
@@ -1418,6 +1417,7 @@ impl MessageProcessor {
                 self.thread_processor.memory_status(params).await
             }
             ClientRequest::MemoryReset { .. } => self.thread_processor.memory_reset().await,
+            ClientRequest::RolloutCompress { .. } => self.thread_processor.rollout_compress(),
             ClientRequest::ThreadUnarchive { params, .. } => {
                 self.thread_processor
                     .thread_unarchive(request_id.clone(), params)

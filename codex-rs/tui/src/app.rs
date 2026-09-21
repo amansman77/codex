@@ -214,6 +214,7 @@ mod backend_banner_fallback;
 mod background_requests;
 mod config_persistence;
 mod connector_mentions;
+mod daemon_menu;
 mod event_dispatch;
 mod exit_summary;
 mod experimental_features;
@@ -605,6 +606,7 @@ pub(crate) struct App {
     app_server_target: AppServerTarget,
     reconnect: reconnect::ReconnectState,
     /// Set when the user confirms an update; propagated on exit.
+    daemon_cli_executable: Option<AbsolutePathBuf>,
     pub(crate) pending_update_action: Option<UpdateAction>,
 
     /// Tracks the thread we intentionally shut down while exiting the app.
@@ -895,6 +897,8 @@ impl App {
 
         match &event {
             TuiEvent::FocusLost => {
+                self.chat_widget
+                    .set_sparkle_terminal_focus(/*focused*/ false);
                 let now = Instant::now();
                 let thread_id = self.current_displayed_thread_id();
 
@@ -1009,6 +1013,8 @@ impl App {
 
     fn render_chat_widget_frame(&mut self, tui: &mut tui::Tui, screen_size: Size) -> Result<Rect> {
         self.sync_thread_title_progress();
+        self.chat_widget
+            .set_sparkle_terminal_focus(tui.is_terminal_focused());
         let dashboard_visible = self
             .chat_widget
             .selected_index_for_present_view(AGENTS_OVERVIEW_VIEW_ID)

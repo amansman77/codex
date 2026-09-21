@@ -2219,6 +2219,7 @@ dependencies = [
  "codex-network-proxy",
  "codex-otel",
  "codex-plugin",
+ "codex-prompts",
  "codex-protocol",
  "codex-queue-extension",
  "codex-rmcp-client",
@@ -2412,6 +2413,7 @@ dependencies = [
  "hmac 0.12.1",
  "httpdate",
  "jsonwebtoken",
+ "libc",
  "owo-colors",
  "pretty_assertions",
  "rand 0.9.3",
@@ -2476,6 +2478,7 @@ name = "codex-async-utils"
 version = "0.0.0"
 dependencies = [
  "pretty_assertions",
+ "rand 0.9.3",
  "tokio",
  "tokio-util",
 ]
@@ -2487,6 +2490,7 @@ dependencies = [
  "pretty_assertions",
  "serde",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -2628,6 +2632,7 @@ dependencies = [
  "codex-skills-extension",
  "codex-state",
  "codex-stdio-to-uds",
+ "codex-tcp-tunnel",
  "codex-terminal-detection",
  "codex-thread-store",
  "codex-tui",
@@ -2665,6 +2670,7 @@ dependencies = [
  "tracing-subscriber",
  "unicode-segmentation",
  "url",
+ "vt100",
  "which 8.0.0",
  "windows-sys 0.52.0",
  "wiremock",
@@ -2691,6 +2697,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "codex-agent-identity",
+ "codex-async-utils",
  "codex-backend-client",
  "codex-config",
  "codex-core",
@@ -3210,6 +3217,7 @@ dependencies = [
  "codex-utils-cargo-bin",
  "codex-utils-cli",
  "codex-utils-oss",
+ "codex-utils-path-uri",
  "codex-utils-sandbox-summary",
  "codex-worktree",
  "core_test_support",
@@ -3258,6 +3266,7 @@ dependencies = [
  "codex-shell-command",
  "codex-test-binary-support",
  "codex-utils-absolute-path",
+ "codex-utils-cargo-bin",
  "codex-utils-home-dir",
  "codex-utils-path-uri",
  "codex-utils-pty",
@@ -3537,6 +3546,7 @@ dependencies = [
  "codex-core",
  "codex-extension-api",
  "codex-otel",
+ "codex-prompts",
  "codex-protocol",
  "codex-rollout",
  "codex-state",
@@ -3573,6 +3583,7 @@ dependencies = [
  "codex-guardian-context",
  "codex-mcp",
  "codex-otel",
+ "codex-prompts",
  "codex-protocol",
  "opentelemetry",
  "opentelemetry_sdk",
@@ -3593,6 +3604,8 @@ dependencies = [
  "anyhow",
  "codex-analytics",
  "codex-api",
+ "codex-config",
+ "codex-context-fragments",
  "codex-core",
  "codex-extension-api",
  "codex-features",
@@ -3603,6 +3616,7 @@ dependencies = [
  "codex-login",
  "codex-model-provider",
  "codex-model-provider-info",
+ "codex-prompts",
  "codex-protocol",
  "core_test_support",
  "dirs",
@@ -3783,6 +3797,7 @@ dependencies = [
  "codex-process-hardening",
  "codex-protocol",
  "codex-sandboxing",
+ "codex-uds",
  "codex-utils-absolute-path",
  "globset",
  "landlock",
@@ -4071,10 +4086,10 @@ name = "codex-models-manager"
 version = "0.0.0"
 dependencies = [
  "chrono",
- "codex-collaboration-mode-templates",
  "codex-http-client",
  "codex-login",
  "codex-otel",
+ "codex-prompts",
  "codex-protocol",
  "codex-utils-output-truncation",
  "pretty_assertions",
@@ -4123,6 +4138,7 @@ dependencies = [
  "opentelemetry",
  "pretty_assertions",
  "rama-core",
+ "rama-dns",
  "rama-http",
  "rama-http-backend",
  "rama-net",
@@ -4242,13 +4258,16 @@ name = "codex-prompts"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "codex-collaboration-mode-templates",
  "codex-context-fragments",
  "codex-execpolicy",
  "codex-git-utils",
+ "codex-guardian-context",
  "codex-protocol",
  "codex-utils-absolute-path",
  "codex-utils-template",
  "pretty_assertions",
+ "tracing",
 ]
 
 [[package]]
@@ -4462,6 +4481,7 @@ dependencies = [
  "codex-network-proxy",
  "codex-otel",
  "codex-protocol",
+ "codex-uds",
  "codex-utils-absolute-path",
  "codex-utils-home-dir",
  "codex-utils-path-uri",
@@ -4634,6 +4654,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "codex-tcp-tunnel"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "clap",
+ "h3",
+ "h3-quinn",
+ "http 1.4.0",
+ "pretty_assertions",
+ "quinn",
+ "rand 0.9.3",
+ "rcgen",
+ "rustls",
+ "rustls-native-certs",
+ "serde_json",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "codex-terminal-detection"
 version = "0.0.0"
 dependencies = [
@@ -4729,6 +4770,7 @@ dependencies = [
  "clap",
  "codex-ansi-escape",
  "codex-app-server-client",
+ "codex-app-server-daemon",
  "codex-app-server-protocol",
  "codex-arg0",
  "codex-backend-client",
@@ -4748,6 +4790,7 @@ dependencies = [
  "codex-install-context",
  "codex-login",
  "codex-mcp",
+ "codex-mermaid",
  "codex-message-history",
  "codex-model-provider",
  "codex-model-provider-info",
@@ -4818,6 +4861,7 @@ dependencies = [
  "tokio-tungstenite",
  "tokio-util",
  "toml 0.9.11+spec-1.1.0",
+ "toml_edit 0.24.0+spec-1.1.0",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
@@ -4841,6 +4885,7 @@ name = "codex-uds"
 version = "0.0.0"
 dependencies = [
  "async-io",
+ "libc",
  "pretty_assertions",
  "tempfile",
  "tokio",
@@ -5094,6 +5139,7 @@ version = "0.0.0"
 dependencies = [
  "codex-protocol",
  "codex-utils-absolute-path",
+ "codex-utils-path-uri",
  "pretty_assertions",
 ]
 
@@ -8464,6 +8510,32 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+]
+
+[[package]]
+name = "h3"
+version = "0.0.8"
+source = "git+https://github.com/hyperium/h3?rev=e07e69412876f7e26f026bd75a48b2704d8c8283#e07e69412876f7e26f026bd75a48b2704d8c8283"
+dependencies = [
+ "bytes",
+ "fastrand",
+ "futures-util",
+ "http 1.4.0",
+ "pin-project-lite",
+ "tokio",
+]
+
+[[package]]
+name = "h3-quinn"
+version = "0.0.10"
+source = "git+https://github.com/hyperium/h3?rev=e07e69412876f7e26f026bd75a48b2704d8c8283#e07e69412876f7e26f026bd75a48b2704d8c8283"
+dependencies = [
+ "bytes",
+ "futures",
+ "h3",
+ "quinn",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -12043,6 +12115,7 @@ checksum = "b9e20a958963c291dc322d98411f541009df2ced7b5a4f2bd52337638cfccf20"
 dependencies = [
  "bytes",
  "cfg_aliases 0.2.1",
+ "futures-io",
  "pin-project-lite",
  "quinn-proto",
  "quinn-udp 0.5.14",

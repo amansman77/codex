@@ -9,6 +9,7 @@ use codex_history::RolloutItem;
 use codex_login::CodexAuth;
 use codex_models_manager::bundled_models_response;
 use codex_models_manager::manager::RefreshStrategy;
+use codex_prompts::render_model_instructions;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
@@ -199,12 +200,12 @@ async fn first_turn_model_change_appends_model_instructions_developer_message(
     let request = resp_mock.single_request();
     assert_eq!(request.body_json()["model"], next_model);
     let developer_texts = request.message_input_texts("developer");
-    let expected_instructions = bundled_models_response()?
+    let expected_model = bundled_models_response()?
         .models
         .into_iter()
         .find(|model| model.slug == next_model)
-        .expect("expected target model in bundled catalog")
-        .get_model_instructions(personality.or(test.config.personality));
+        .expect("expected target model in bundled catalog");
+    let expected_instructions = render_model_instructions(&expected_model);
     assert!(
         developer_texts.iter().any(|text| {
             text.contains("<model_switch>") && text.contains(&expected_instructions)
@@ -716,7 +717,7 @@ async fn unsupported_configured_service_tier_warns_at_session_start() -> Result<
     let mut builder = test_codex()
         .with_model(model_slug)
         .with_config(move |config| {
-            config.service_tier = Some(ServiceTier::Flex.request_value().to_string());
+            config.service_tier = Some(ServiceTier::Fast.request_value().to_string());
             config.model_catalog = Some(ModelsResponse {
                 models: vec![model],
             });
@@ -736,7 +737,7 @@ async fn unsupported_configured_service_tier_warns_at_session_start() -> Result<
     };
     assert_eq!(
         warning.message,
-        "Configured service tier `flex` is not advertised as supported for model `test-no-tier-model` and will be omitted from requests."
+        "Configured service tier `priority` is not advertised as supported for model `test-no-tier-model` and will be omitted from requests."
     );
     Ok(())
 }

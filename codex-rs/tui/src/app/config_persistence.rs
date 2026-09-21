@@ -252,7 +252,7 @@ impl App {
         if self.reject_pending_permission_change() {
             return;
         }
-        if selection.profile_id.starts_with(':')
+        if (self.chat_widget.thread_id().is_none() && selection.profile_id.starts_with(':'))
             || (app_server.thread_params_mode()
                 == crate::app_server_session::ThreadParamsMode::Embedded
                 && self
@@ -274,7 +274,9 @@ impl App {
             );
             return;
         };
-        if self.chat_widget.is_user_turn_pending_or_running() {
+        if !selection.profile_id.starts_with(':')
+            && self.chat_widget.is_user_turn_pending_or_running()
+        {
             self.chat_widget
                 .retain_input_after_failed_permission_selection();
             self.chat_widget.add_error_message(
@@ -297,6 +299,7 @@ impl App {
             self.agents_overview
                 .selected_permission_profiles
                 .insert(thread_id, selection.profile_id);
+            self.chat_widget.submit_initial_user_message_if_pending();
             return;
         }
         let params = ThreadSettingsUpdateParams {
@@ -326,13 +329,13 @@ impl App {
                 self.chat_widget
                     .retain_input_after_failed_permission_selection();
                 self.chat_widget
-                    .add_error_message("Named profiles require a newer app server.".into());
+                    .add_error_message("Permission selection requires a newer app server.".into());
             }
             Err(error) => {
                 self.chat_widget
                     .retain_input_after_failed_permission_selection();
                 self.chat_widget
-                    .add_error_message(format!("Failed to select permissions: {error}"));
+                    .add_error_message(format!("Failed to select permissions: {error:#}"));
             }
         }
     }
@@ -349,6 +352,19 @@ impl App {
             return true;
         }
         false
+    }
+
+    pub(super) fn reject_pending_permission_root_switch(&mut self) -> bool {
+        if !self
+            .pending_server_profiles
+            .keys()
+            .any(|thread_id| !self.thread_unavailable(*thread_id))
+        {
+            return false;
+        }
+        self.chat_widget
+            .add_error_message("Wait for permissions to update before switching tasks.".into());
+        true
     }
 
     pub(super) fn confirmed_server_profile(
@@ -1361,7 +1377,7 @@ mod tests {
 
             let default_effort =
                 app.on_apply_advanced_reasoning("gpt-5.5", ReasoningEffortConfig::Ultra);
-            let new_thread_config = app.fresh_session_config();
+            let new_thread_config = &app.config;
 
             assert_eq!(default_effort, Some(expected_default_effort.clone()));
             assert_eq!(app.chat_widget.current_model(), "gpt-5.5");
@@ -1372,7 +1388,7 @@ mod tests {
             assert_eq!(
                 (
                     new_thread_config.model.as_deref(),
-                    new_thread_config.model_reasoning_effort,
+                    new_thread_config.model_reasoning_effort.clone(),
                 ),
                 (Some("gpt-5.5"), Some(expected_default_effort))
             );
@@ -1401,7 +1417,7 @@ mod tests {
 
         let default_effort =
             app.on_apply_advanced_reasoning("ultra-only", ReasoningEffortConfig::Ultra);
-        let new_thread_config = app.fresh_session_config();
+        let new_thread_config = &app.config;
 
         assert_eq!(default_effort, None);
         assert_eq!(app.chat_widget.current_model(), "ultra-only");
@@ -1412,7 +1428,7 @@ mod tests {
         assert_eq!(
             (
                 new_thread_config.model.as_deref(),
-                new_thread_config.model_reasoning_effort,
+                new_thread_config.model_reasoning_effort.clone(),
             ),
             (Some("gpt-5.5"), Some(ReasoningEffortConfig::Low))
         );
@@ -1658,7 +1674,7 @@ enabled = false
         )?;
 
         let assert_cloud_requirements = |app: &App| {
-            let config = app.fresh_session_config();
+            let config = &app.config;
             assert_eq!(
                 config
                     .config_layer_stack

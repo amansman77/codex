@@ -94,7 +94,6 @@ use codex_protocol::models::ContentItem;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
-use codex_protocol::openai_models::ModelMessages;
 use codex_protocol::protocol::AgentMessageContentDeltaEvent;
 use codex_protocol::protocol::AgentReasoningSectionBreakEvent;
 use codex_protocol::protocol::CodexErrorInfo;
@@ -1195,6 +1194,7 @@ async fn track_turn_resolved_config_analytics(
             turn_id: turn_context.sub_id.clone(),
             thread_id: sess.thread_id.to_string(),
             turn_metadata: turn_context.turn_metadata_state.clone(),
+            active_plugin_ids_at_turn_start: turn_context.active_plugin_ids_for_telemetry(),
             num_input_images: input
                 .iter()
                 .filter_map(|item| match item {
@@ -1321,6 +1321,12 @@ async fn maybe_run_previous_model_inline_compact(
         turn_context.model_info().comp_hash.as_deref(),
     );
     let previous_model = previous_turn_settings.model;
+    if crate::guardian::is_basic_session_source(&turn_context.session_source)
+        && !should_compact_for_comp_hash_change
+        && previous_model == turn_context.model_info().slug
+    {
+        return Ok(());
+    }
     let previous_model_turn_context = Arc::new(
         turn_context
             .with_model(previous_model.clone(), &sess.services.models_manager)
@@ -1670,7 +1676,6 @@ pub(crate) async fn prepare_tool_recommendations(
         .services
         .plugins_manager
         .plugins_for_config(&turn_context.config.plugins_config_input())
-        .instrument(trace_span!("built_tools.load_plugins"))
         .await
         .without_plugins(&turn_context.disabled_plugin_ids);
     let tool_suggest_is_enabled = tool_suggest_enabled(turn_context);
@@ -1714,7 +1719,6 @@ pub(crate) async fn built_tools(
     sess: &Session,
     turn_context: &TurnContext,
     model_info: &codex_protocol::openai_models::ModelInfo,
-    model_messages: Option<&ModelMessages>,
     environments: &TurnEnvironmentSnapshot,
     mcp: &Arc<codex_mcp::McpBinding>,
     step_store: &ExtensionData,
@@ -1784,7 +1788,6 @@ pub(crate) async fn built_tools(
         sess,
         turn_context,
         model_info,
-        model_messages,
         environments,
         mcp,
         apps_enabled,

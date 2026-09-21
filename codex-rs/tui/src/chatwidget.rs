@@ -382,6 +382,7 @@ mod model_popups;
 mod notifications;
 mod session_model_selection;
 use self::notifications::Notification;
+pub(crate) use self::session_model_selection::AstraModelPickerAction;
 mod permission_discovery;
 mod permission_popups;
 mod permission_shortcuts;
@@ -869,7 +870,6 @@ pub(crate) enum ReplayKind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SessionConfiguredDisplay {
     Normal,
-    PromptEdit,
     /// Apply session state without emitting the session info cell.
     Quiet,
     SideConversation,
