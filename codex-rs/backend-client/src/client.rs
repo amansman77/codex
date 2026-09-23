@@ -12,8 +12,10 @@ use anyhow::Result;
 use codex_api::SharedAuthProvider;
 use codex_http_client::ClientRouteClass;
 use codex_http_client::HttpClientFactory;
+use codex_http_client::OutboundProxyPolicy;
+use codex_http_client::RequestBuilder;
 use codex_http_client::RouteAwareClientPool;
-use codex_http_client::RouteAwareRequestBuilder;
+use codex_http_client::RouteAwareRequestError;
 use codex_login::CodexAuth;
 use codex_login::default_client::get_codex_user_agent;
 use codex_protocol::account::PlanType as AccountPlanType;
@@ -33,6 +35,7 @@ use http::header::USER_AGENT;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::fmt;
+use std::time::Duration;
 
 pub(crate) mod analytics;
 mod chatgpt_turn_cost;
@@ -268,13 +271,13 @@ impl Client {
         h
     }
 
-    fn request(&self, method: Method, url: &str) -> RouteAwareRequestBuilder {
+    fn request(&self, method: Method, url: &str) -> RequestBuilder {
         self.http.request(method, url)
     }
 
     async fn exec_request(
         &self,
-        req: RouteAwareRequestBuilder,
+        req: RequestBuilder,
         method: &str,
         url: &str,
     ) -> Result<(String, String)> {
@@ -286,7 +289,7 @@ impl Client {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
-        let body = res.text().await.unwrap_or_default();
+        let body = res.text().await.map_err(anyhow::Error::from)?;
         if !status.is_success() {
             anyhow::bail!("{method} {url} failed: {status}; content-type={ct}; body={body}");
         }
@@ -295,7 +298,7 @@ impl Client {
 
     async fn exec_request_detailed(
         &self,
-        req: RouteAwareRequestBuilder,
+        req: RequestBuilder,
         method: &str,
         url: &str,
     ) -> std::result::Result<(String, String), RequestError> {
@@ -307,7 +310,7 @@ impl Client {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
-        let body = res.text().await.unwrap_or_default();
+        let body = res.text().await.map_err(anyhow::Error::from)?;
         if !status.is_success() {
             return Err(RequestError::UnexpectedStatus {
                 method: method.to_string(),
@@ -318,6 +321,39 @@ impl Client {
             });
         }
         Ok((body, content_type))
+    }
+
+    async fn exec_bootstrap_get(
+        &self,
+        url: &str,
+    ) -> std::result::Result<(String, String), RequestError> {
+        let request = self.request(Method::GET, url).headers(self.headers());
+        if !self.http.allows_system_proxy_fallback() {
+            return self.exec_request_detailed(request, "GET", url).await;
+        }
+
+        // Bound the complete GET, including its body, to leave time for proxy discovery and retry
+        // within the cloud loader's startup budget. GETs are safe to retry after a response timeout.
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            self.exec_request_detailed(request, "GET", url),
+        )
+        .await
+        {
+            Ok(Err(RequestError::Other(error)))
+                if error
+                    .downcast_ref::<RouteAwareRequestError>()
+                    .is_some_and(|error| error.is_connect() || error.is_timeout()) => {}
+            Err(_) => {}
+            Ok(response) => return response,
+        }
+
+        let http = self
+            .http
+            .clone()
+            .with_outbound_proxy_policy(OutboundProxyPolicy::RespectSystemProxy);
+        let request = http.get(url).headers(self.headers());
+        self.exec_request_detailed(request, "GET", url).await
     }
 
     fn decode_json<T: DeserializeOwned>(&self, url: &str, ct: &str, body: &str) -> Result<T> {
@@ -349,8 +385,7 @@ impl Client {
             PathStyle::CodexApi => format!("{}/api/codex/accounts/check", self.base_url),
             PathStyle::ChatGptApi => format!("{}/wham/accounts/check", self.base_url),
         };
-        let req = self.request(Method::GET, &url).headers(self.headers());
-        let (body, _) = self.exec_request_detailed(req, "GET", &url).await?;
+        let (body, _) = self.exec_bootstrap_get(&url).await?;
         serde_json::from_str(&body)
             .map_err(|_| RequestError::Other(anyhow::anyhow!("Invalid accounts response.")))
     }
@@ -480,8 +515,7 @@ impl Client {
             PathStyle::CodexApi => format!("{}/api/codex/config/bundle", self.base_url),
             PathStyle::ChatGptApi => format!("{}/wham/config/bundle", self.base_url),
         };
-        let req = self.request(Method::GET, &url).headers(self.headers());
-        let (body, ct) = self.exec_request_detailed(req, "GET", &url).await?;
+        let (body, ct) = self.exec_bootstrap_get(&url).await?;
         self.decode_json::<ConfigBundleResponse>(&url, &ct, &body)
             .map_err(RequestError::from)
     }
