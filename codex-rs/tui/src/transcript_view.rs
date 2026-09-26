@@ -19,6 +19,7 @@ mod search;
 mod selection;
 mod snapshot;
 mod text;
+mod turn_tip;
 
 use std::sync::Arc;
 
@@ -84,10 +85,12 @@ struct VisibleRow {
 
 /// Shared scrolling and interaction state for compact and detailed transcript presentations.
 pub(crate) struct TranscriptView {
+    pub(crate) copy_on_select: bool,
     position: Position,
     follow_control: follow_control::FollowControl,
     copy_feedback: Option<composer_gap::CopyFeedback>,
     composer_tip: Option<(Rect, HyperlinkLine)>,
+    turn_tip_key: Option<EntryKey>,
     cache: LayoutCache,
     live: Option<Arc<TextLayout>>,
     live_separated: Option<Arc<TextLayout>>,
@@ -114,10 +117,12 @@ pub(crate) struct TranscriptView {
 impl Default for TranscriptView {
     fn default() -> Self {
         Self {
+            copy_on_select: false,
             position: Position::Latest,
             follow_control: follow_control::FollowControl::default(),
             copy_feedback: None,
             composer_tip: None,
+            turn_tip_key: None,
             cache: LayoutCache::default(),
             live: None,
             live_separated: None,
@@ -589,3 +594,11 @@ impl TranscriptView {
 #[cfg(test)]
 #[path = "transcript_view_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "transcript_view/markdown_copy_tests.rs"]
+mod markdown_copy_tests;
+
+#[cfg(test)]
+#[path = "transcript_view/copy_on_select_tests.rs"]
+mod copy_on_select_tests;
