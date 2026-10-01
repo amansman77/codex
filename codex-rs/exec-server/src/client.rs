@@ -150,7 +150,6 @@ mod recovery;
 #[path = "client_refresh.rs"]
 mod refresh;
 pub(crate) use connection_failure::can_retry_connection_attempt;
-#[cfg(test)]
 pub(crate) use recovery::is_environment_offline_error;
 pub(crate) use recovery::is_retryable_recovery_error;
 
@@ -291,7 +290,7 @@ struct Inner {
     session_id: OnceLock<String>,
     retired: CancellationToken,
     /// Caches metadata from initialization or the first successful info request for this client's lifetime.
-    environment_info: OnceCell<EnvironmentInfo>,
+    environment_info: OnceCell<Arc<EnvironmentInfo>>,
     reconnect_strategy: Option<ExecServerReconnectStrategy>,
 }
 
@@ -653,7 +652,7 @@ impl HttpClient for LazyRemoteExecServerClient {
 
 impl LazyRemoteExecServerClient {
     pub(crate) async fn environment_info(&self) -> Result<EnvironmentInfo, ExecServerError> {
-        self.get().await?.environment_info().await
+        Ok(self.get().await?.environment_info().await?.as_ref().clone())
     }
 }
 
@@ -828,11 +827,11 @@ impl ExecServerClient {
         self.call(EXEC_METHOD, &params).await
     }
 
-    /// Returns cached executor metadata, fetching it lazily if initialization omitted it.
-    pub async fn environment_info(&self) -> Result<EnvironmentInfo, ExecServerError> {
+    /// Returns shared cached executor metadata, fetching it lazily if initialization omitted it.
+    pub async fn environment_info(&self) -> Result<Arc<EnvironmentInfo>, ExecServerError> {
         self.inner
             .environment_info
-            .get_or_try_init(|| self.force_environment_info())
+            .get_or_try_init(|| async { self.force_environment_info().await.map(Arc::new) })
             .await
             .cloned()
     }
@@ -841,11 +840,25 @@ impl ExecServerClient {
     // TODO: Remove after app-server migrates off this call.
     pub async fn force_environment_info(&self) -> Result<EnvironmentInfo, ExecServerError> {
         let rpc_client = self.rpc_client().await?;
-        self.map_rpc_call_result(
-            rpc_client
-                .call_with_timeout(ENVIRONMENT_INFO_METHOD, &(), ENVIRONMENT_INFO_TIMEOUT)
-                .await,
+        // Bound sending as well as receiving: a stuck transport can fill the outbound queue.
+        let result = timeout(
+            ENVIRONMENT_INFO_TIMEOUT,
+            rpc_client.call(ENVIRONMENT_INFO_METHOD, &()),
         )
+        .await;
+        match result {
+            Ok(result) => self.map_rpc_call_result(result),
+            Err(_) => {
+                let error = ExecServerError::from(RpcCallError::TimedOut {
+                    method: ENVIRONMENT_INFO_METHOD.to_string(),
+                    timeout: ENVIRONMENT_INFO_TIMEOUT,
+                });
+                // Retire only the connection we probed; recovery ignores a stale client.
+                rpc_client.close_transport().await;
+                self.inner.request_recovery(rpc_client, error.to_string());
+                Err(error)
+            }
+        }
     }
 
     pub async fn read_environment_config(
@@ -1279,7 +1292,7 @@ impl ExecServerClient {
             .await?;
         if let Some(info) = initialize_response.environment_info {
             assert!(
-                client.inner.environment_info.set(info).is_ok(),
+                client.inner.environment_info.set(Arc::new(info)).is_ok(),
                 "new client metadata cache must be empty"
             );
         }
@@ -2655,15 +2668,20 @@ mod tests {
         })
         .await?;
 
-        assert_eq!(client.environment_info().await?, expected_info);
+        let info = client.environment_info().await?;
+        assert_eq!(info.as_ref(), &expected_info);
         server.await?;
         // The server is gone, so a cloned client must use the shared cache.
-        assert_eq!(client.clone().environment_info().await?, expected_info);
+        let cached_info = client.clone().environment_info().await?;
+        assert_eq!(cached_info.as_ref(), &expected_info);
+        assert!(Arc::ptr_eq(&info, &cached_info));
         Ok(())
     }
 
+    #[test_case::test_case(false; "socket_closed")]
+    #[test_case::test_case(true; "health_check_timed_out")]
     #[tokio::test]
-    async fn remote_websocket_client_resumes_session() {
+    async fn remote_websocket_client_resumes_session(health_check_timeout: bool) {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("listener should bind");
@@ -2681,7 +2699,22 @@ mod tests {
                 /*expected_resume_session_id*/ None,
             )
             .await;
-            first.close(None).await.expect("websocket should close");
+            if health_check_timeout {
+                let JSONRPCMessage::Request(request) = read_jsonrpc_websocket(&mut first).await
+                else {
+                    panic!("expected environment info request");
+                };
+                assert_eq!(request.method, "environment/info");
+                // Keep the socket open without answering. The client must close it itself.
+                while let Some(Ok(message)) = first.next().await {
+                    assert!(matches!(message, Message::Ping(_) | Message::Close(_)));
+                    if matches!(message, Message::Close(_)) {
+                        break;
+                    }
+                }
+            } else {
+                first.close(None).await.expect("websocket should close");
+            }
 
             let mut resumed = accept_websocket(&listener).await;
             complete_websocket_initialize(
@@ -2704,6 +2737,13 @@ mod tests {
             HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
         );
         let stable_client = client.get().await.expect("client should connect");
+        if health_check_timeout {
+            let error = stable_client
+                .force_environment_info()
+                .await
+                .expect_err("unanswered health check should time out");
+            assert!(error.to_string().contains("timed out"));
+        }
         timeout(Duration::from_secs(1), resumed_rx)
             .await
             .expect("session resume should not time out")
