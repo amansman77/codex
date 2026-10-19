@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use codex_features::Feature;
 use codex_guardian_reviewer::guardian_output_contract_prompt;
+use codex_login::AuthManager;
 use codex_prompts::GuardianPolicyInstructions;
 use codex_prompts::ResolvedModelMessages;
 use codex_protocol::models::BaseInstructionsProvenance;
@@ -99,11 +100,40 @@ pub(crate) async fn resolve_review_model(
         )
         .await;
     let default_review_model_id = turn.provider.approval_review_preferred_model();
+    // `available_models` is filtered by auth mode/visibility, not by whether
+    // the *active provider* can actually serve a given model id. For custom
+    // providers (Azure OpenAI, self-hosted proxies, etc.) the default
+    // preferred review model (e.g. `codex-auto-review`) can still show up in
+    // that catalog even though it isn't a real deployment on that provider,
+    // which previously caused the guardian to send a literal
+    // `codex-auto-review` model id to a non-OpenAI-hosted backend and 404.
+    // Only trust the catalog match when the user explicitly configured an
+    // override, or when the provider actually routes through OpenAI-hosted
+    // infrastructure; otherwise strip the unservable default so
+    // `select_review_model` falls through to the active session model.
+    let provider_can_serve_preferred_review_model = context
+        .model_info
+        .auto_review_model_override
+        .is_some()
+        || turn.provider.info().uses_openai_actor_authorization()
+        || (turn.provider.info().requires_openai_auth
+            && turn
+                .auth_manager
+                .as_deref()
+                .is_some_and(AuthManager::current_auth_uses_codex_backend));
+    let available_models_for_review = if provider_can_serve_preferred_review_model {
+        available_models
+    } else {
+        available_models
+            .into_iter()
+            .filter(|preset| preset.model != default_review_model_id)
+            .collect()
+    };
     let review_model = codex_guardian_reviewer::select_review_model(
         &context.model_info,
         context.reasoning_effort.as_ref(),
         default_review_model_id,
-        &available_models,
+        &available_models_for_review,
     );
     // Resolve a separate reviewer against the current catalog on every attempt.
     // Parent fallback must retain the action's metadata even after a catalog refresh.
