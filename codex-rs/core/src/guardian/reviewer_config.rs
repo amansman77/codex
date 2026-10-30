@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use codex_features::Feature;
 use codex_guardian_reviewer::reviewer_instructions;
+use codex_login::AuthManager;
 use codex_models_manager::manager::RefreshStrategy;
 use codex_prompts::ResolvedModelMessages;
 use codex_protocol::models::BaseInstructionsProvenance;
@@ -151,6 +152,30 @@ async fn resolve_review_model_from_catalog(
             .collect(),
     );
     let default_review_model_id = turn.provider.approval_review_preferred_model();
+    // The origin filter above only drops bundled entries. The shared models
+    // manager follows the app-server's base provider, so a thread on a custom
+    // provider (e.g. Azure OpenAI) can still see `codex-auto-review` as a
+    // provider-origin entry from the OpenAI catalog and send it to a backend
+    // that has no such deployment (404). Drop it unless the active provider
+    // can actually serve it or the model explicitly overrides the reviewer.
+    let provider_can_serve_preferred_review_model = context
+        .model_info
+        .auto_review_model_override
+        .is_some()
+        || turn.provider.info().uses_openai_actor_authorization()
+        || (turn.provider.info().requires_openai_auth
+            && turn
+                .auth_manager
+                .as_deref()
+                .is_some_and(AuthManager::current_auth_uses_codex_backend));
+    let available_models: Vec<_> = if provider_can_serve_preferred_review_model {
+        available_models
+    } else {
+        available_models
+            .into_iter()
+            .filter(|preset| preset.model != default_review_model_id)
+            .collect()
+    };
     let review_model = codex_guardian_reviewer::select_review_model(
         &context.model_info,
         context.reasoning_effort.as_ref(),
